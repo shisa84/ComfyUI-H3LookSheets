@@ -1,13 +1,16 @@
 """Prompt construction for MiniMax H3's ref2va (reference-to-video) mode.
 
 Builds the multi-reference prompt H3's guide expects when conditioning
-`MiniMaxH3ReferenceToVideo` on two images: a person (<Picture 1>) and a look
-to dress them in (<Picture 2>). The vision-language description of each image
-stays outside this node — plug in two `TextGenerate` nodes (one prompted to
-describe the person while ignoring clothes, one prompted to describe the look
-while ignoring hair) and feed their generated text in here. This node only
-assembles the `subject_definitions` / `summary` / `retention_analysis` /
-`detailed_description` structure ref2va expects around those two sentences.
+`MiniMaxH3ReferenceToVideo` on a person (<Picture 1>) and a look to dress
+them in — one photo (<Picture 2>) or several (<Picture 2>, <Picture 3>...
+for a look shown across front/back/shoes etc). The vision-language
+description of each image stays outside this node — plug in
+`H3LookSheetsDescribe` nodes (target=person for the one person photo,
+target=outfit for one or several outfit photos) and feed their generated
+text in here, along with `outfit_image_count` when the outfit spans more
+than one photo. This node only assembles the `subject_definitions` /
+`summary` / `retention_analysis` / `detailed_description` structure ref2va
+expects around those descriptions.
 """
 
 from __future__ import annotations
@@ -98,18 +101,85 @@ def _timecode(seconds: float) -> str:
     return f"{int(minutes):02d}:{rest:06.3f}"
 
 
+def _picture_tags(start: int, count: int) -> list[str]:
+    """`<Picture start>`, `<Picture start+1>`, ... `count` of them.
+
+    <Picture 1> is always the person; the outfit starts at <Picture 2> and
+    spans `count` consecutive tags when it's described across several
+    photos (front, back, shoes...). `count` must match, in order, the
+    outfit images wired into MiniMaxH3ReferenceToVideo's ref_image sockets
+    — the person's photo first, then the outfit photos in the same order
+    they were described here. H3 numbers <Picture i> by connection order on
+    that node, not by anything this node knows about, so the two have to be
+    kept in sync by hand.
+    """
+    return [f"<Picture {start + i}>" for i in range(count)]
+
+
+def _join_tags_english(tags: list[str]) -> str:
+    """Oxford-style join for a list of `<Picture N>` tags in running prose."""
+    if len(tags) == 1:
+        return tags[0]
+    if len(tags) == 2:
+        return f"{tags[0]} and {tags[1]}"
+    return ", ".join(tags[:-1]) + f" and {tags[-1]}"
+
+
+def _parse_multi_description(text: str) -> list[str]:
+    """Unwrap H3LookSheetsDescribe's `{"outfit_0": "...", "outfit_1": "..."}`
+    JSON into an ordered list of per-picture description strings.
+
+    Falls back to `[text]` for anything that isn't a JSON object — a plain,
+    manually typed description (or a single H3LookSheetsDescribe entry that
+    was pasted in bare) still works as one picture, same as before this
+    node understood the JSON shape at all.
+    """
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return [str(v) for v in parsed.values()]
+    return [text]
+
+
+def _fill_outfit_descriptions(items: list[str]) -> list[str]:
+    """Clean each entry, substituting a fallback for a blank one instead of
+    dropping it.
+
+    A blank entry (H3LookSheetsDescribe couldn't get a usable caption for
+    that specific picture, even after its own retries/fallback) must still
+    occupy its slot in the list: `outfit_tags`/`outfit_ref` are sized off
+    `len(outfit_items)`, and that count has to keep matching the outfit
+    images actually wired into MiniMaxH3ReferenceToVideo — dropping an
+    empty entry would silently shift every later <Picture N> tag out of
+    sync with the images downstream.
+    """
+    cleaned = [t.strip().rstrip(".") or "the outfit shown" for t in items]
+    return cleaned or ["the outfit shown"]
+
+
 class H3LookSheetsPrompt:
     """Write H3's ref2va prompt for a 6-shot, all-neutral look turnaround.
 
     Two references go in — a person (<Picture 1>) and a look to dress them in
-    (<Picture 2>) — and the prompt asks H3 for a 6-shot turnaround that keeps
-    only <Picture 1>'s identity (hair, body shape, skin, facial structure) and
-    only <Picture 2>'s outfit, discarding everything else either reference
-    carries (<Picture 2>'s own hair, body shape and proportions in
-    particular): [Shot 1] full body -> [Shot 2] face close-up -> [Shot 3] left
-    profile -> [Shot 4] right profile -> [Shot 5] back -> [Shot 6] a second,
-    closer face shot. Every shot is neutral; for other expressions or a
-    freely chosen shot list, use H3LookSheetsCustomPrompt instead.
+    (<Picture 2>, or <Picture 2>, <Picture 3>... when the outfit is shown
+    across several photos). `person_description`/`outfit_description` take
+    either plain text or H3LookSheetsDescribe's JSON output directly — a
+    JSON object there is unwrapped into one description per picture
+    automatically, so the number of <Picture N> tags for the outfit always
+    matches how many entries were in it, no separate count input needed.
+    The prompt asks H3 for a 6-shot turnaround that keeps only <Picture 1>'s
+    identity (hair,
+    body shape, skin, facial structure) and only the outfit pictures'
+    clothing, discarding everything else either reference carries (the
+    outfit pictures' own hair, body shape and proportions in particular):
+    [Shot 1] full body -> [Shot 2] face close-up -> [Shot 3] left profile ->
+    [Shot 4] right profile -> [Shot 5] back -> [Shot 6] a second, closer face
+    shot. Every shot is neutral; for other expressions or a freely chosen
+    shot list, use H3LookSheetsCustomPrompt instead.
 
     Cuts, not a continuous move: a cut forces the model to re-establish
     <Subject 1> at each angle, which is what a turnaround needs, and identity
@@ -152,19 +222,30 @@ class H3LookSheetsPrompt:
               picture_1_gender=_AUTO_PRONOUN, picture_2_subject_type=_AUTO_PRONOUN,
               backdrop="plain light neutral grey studio backdrop",
               video_duration_seconds=5.0):
+        person_items = [t.strip().rstrip(".") for t in _parse_multi_description(person_description) if t.strip()]
+        outfit_items = _fill_outfit_descriptions(_parse_multi_description(outfit_description))
+
         resolved_pronoun = (
-            _detect_pronoun(person_description)
+            _detect_pronoun(person_items[0] if person_items else "")
             if picture_1_gender == _AUTO_PRONOUN else picture_1_gender
         )
         p = _PRONOUNS.get(resolved_pronoun, _NEUTRAL_PRONOUN)
         resolved_subject_type = (
-            _detect_subject_type(outfit_description)
+            _detect_subject_type(" ".join(outfit_items))
             if picture_2_subject_type == _AUTO_PRONOUN else picture_2_subject_type
         )
         subject_noun = _SUBJECT_NOUNS.get(resolved_subject_type, _NEUTRAL_SUBJECT_NOUN)
-        person = person_description.strip().rstrip(".") or "the same figure"
-        outfit = outfit_description.strip().rstrip(".") or "the outfit shown"
+        person = person_items[0] if person_items else "the same figure"
         set_dressing = backdrop.strip().rstrip(".") or "plain light neutral grey studio backdrop"
+        outfit_tags = _picture_tags(2, len(outfit_items))
+        outfit_ref = _join_tags_english(outfit_tags)
+        # Each picture gets its own description + its own "from <Picture N>"
+        # tag, rather than one shared outfit sentence — the outfit pictures
+        # can be genuinely different garments, not just different angles of
+        # the same one.
+        outfit_fragment = ", ".join(
+            f"{text} from {tag}" for text, tag in zip(outfit_items, outfit_tags)
+        )
 
         total_shots = 6
         duration = float(video_duration_seconds)
@@ -176,12 +257,12 @@ class H3LookSheetsPrompt:
 
         header = (
             f"subject_definitions:\n<Subject 1> {person}, and the same figure "
-            f"and proportions established in <Picture 1>. {outfit} "
-            f"from the <Picture 2>, the garment tailored to {p['poss']} own "
+            f"and proportions established in <Picture 1>. {outfit_fragment}, "
+            f"the garment tailored to {p['poss']} own "
             "body shape and proportions from <Picture 1>, not the proportions "
-            "in <Picture 2>. <Picture 1> hairstyle is transferred to <Subject "
+            f"in {outfit_ref}. <Picture 1> hairstyle is transferred to <Subject "
             f"1> — none of the hair, hairstyle, or hair texture of "
-            f"{subject_noun} shown in <Picture 2> is carried over.\n"
+            f"{subject_noun} shown in {outfit_ref} is carried over.\n"
             "<Picture 1> is the first frame of [Shot 1], showing <Subject 1> "
             f"full-body, facing the camera with a neutral expression against "
             f"{set_dressing}."
@@ -192,19 +273,23 @@ class H3LookSheetsPrompt:
             f"<Subject 1> in a {duration:g}-second sequence of "
             f"{total_shots} static shots, retaining only {p['poss']} hair, "
             "body shape, skin, and facial structure from <Picture 1>, while "
-            f"preserving the outfit from <Picture 2>. The background remains "
+            f"preserving the outfit from {outfit_ref}. The background remains "
             f"{set_dressing}. All shots maintain identical framing, lighting, "
             "and pose, every expression neutral throughout."
         )
 
+        outfit_retention = "\n".join(
+            f"{tag} (appears in {shot_tags}): partially_preserved - "
+            "retains only the outfit; no other visual elements or props "
+            "preserved."
+            for tag in outfit_tags
+        )
         retention = (
             "retention_analysis:\n"
             f"<Subject 1> (appears in {shot_tags}): partially_preserved - "
             "retains only hair, hairstyle, body shape, skin, and facial "
             "structure; no clothing or movement preserved.\n"
-            f"<Picture 2> (appears in {shot_tags}): partially_preserved - "
-            "retains only the outfit; no other visual elements or props "
-            "preserved."
+            f"{outfit_retention}"
         )
 
         shots_word = _COUNT_WORDS.get(total_shots, str(total_shots))
@@ -220,8 +305,12 @@ class H3LookSheetsPrompt:
             f"crossing edges. {set_dressing[0].upper()}{set_dressing[1:]} "
             "and its bright, even lighting stay completely identical across "
             f"all {shots_word} shots. No text, watermark, logo, caption, or "
-            "writing of any kind appears anywhere in the video. Between every "
-            "shot, only the camera's position around <Subject 1> changes to "
+            "writing of any kind appears anywhere in the video. "
+            f"<Subject 1> wears the outfit and accessories from {outfit_ref} "
+            f"continuously from the very first frame through all {shots_word} "
+            "shots, without any garment changing, shifting, or being "
+            "removed. Between every shot, only the camera's position around "
+            "<Subject 1> changes to "
             "capture each new angle — <Subject 1> remains completely "
             "motionless throughout, holding one exact pose without turning, "
             "walking, gesturing, or otherwise moving between cuts, and hair "
@@ -279,7 +368,8 @@ class H3LookSheetsPrompt:
 _DESCRIBE_SYSTEM_PROMPTS = {
     "person": (
         "Analyzes the person's physical appearance face, hair, eyes, skin, "
-        "body shape from the provided image, ignore outfit and clothes. \n"
+        "body shape from the provided image, ignore outfit and clothes, and "
+        "ignore the background or setting entirely. \n"
         "Very short description, only 1 sentence."
     ),
     "outfit": (
@@ -288,6 +378,158 @@ _DESCRIBE_SYSTEM_PROMPTS = {
         "Very short description, only 1 sentence"
     ),
 }
+
+#: Outfit conflict resolution: when two outfit photos both happen to show
+#: e.g. footwear, the generic "describe the whole outfit" prompt makes each
+#: image mention its own pair, and H3's prompt ends up listing two different
+#: pairs of shoes for the same subject with no way to tell which to wear.
+#: These per-category `..._image_front`/`..._image_back` combos (shown for
+#: target=outfit) let the user assign which connected image is the source
+#: for each garment category — and, since a garment like a dress can look
+#: different front and back, separately for its front and back view.
+#: Assigning any of them switches every connected image's system prompt to
+#: an exclusion-aware one — the assigned image is told to describe *only*
+#: its assigned categories (and from which side, if that matters), and
+#: every other image is told to skip those same categories — so no two
+#: images ever claim the same category. Leaving all of them at "auto" (the
+#: default) keeps the original single generic "describe the whole outfit"
+#: prompt per image, unchanged. This only feeds the description text itself
+#: (`subject_definitions`) — which shots the final video actually needs a
+#: back view for is a separate concern the prompt-building nodes handle on
+#: their own, unrelated to this.
+_OUTFIT_CATEGORIES = ["top", "bottom", "shoes", "accessories"]
+_OUTFIT_VIEWS = ["front", "back"]
+#: Only garments whose silhouette can meaningfully differ front vs back (a
+#: top, a skirt/dress bottom) get separate front/back source fields — shoes
+#: and accessories keep a single field each; a back-of-the-shoe or
+#: back-of-the-bag detail isn't worth doubling their field count for.
+_CATEGORIES_WITH_VIEW = {"top", "bottom"}
+
+
+def _outfit_field_id(cat: str, view: str) -> str:
+    """The combo's input id for this category/view — `{cat}_image_{view}`
+    for a category that supports the front/back split, plain `{cat}_image`
+    (view-less) otherwise."""
+    return f"{cat}_image_{view}" if cat in _CATEGORIES_WITH_VIEW else f"{cat}_image"
+
+
+_CATEGORY_PHRASES = {
+    "top": "top / upper-body garment (shirt, blouse, jacket...)",
+    "bottom": "bottom / lower-body garment (pants, skirt...)",
+    "shoes": "footwear (shoes, boots)",
+    "accessories": "accessories (bag, belt, jewelry, headwear, glasses...)",
+}
+
+#: Extra, category-specific instructions appended only when that category is
+#: this image's own to describe — a "black boots" caption is ambiguous
+#: between an ankle boot and a thigh-high one, and that ambiguity is exactly
+#: what leads the final video generation to render ordinary shoes with
+#: separate hosiery instead of one continuous over-the-knee boot (or vice
+#: versa). Not every category needs this; only add an entry where the
+#: category can vary in a way plain naming doesn't capture.
+_CATEGORY_EXTRA_GUIDANCE = {
+    "shoes": (
+        "If it extends up the leg, state where it starts and how high it "
+        "reaches (ankle, calf, knee, or mid-thigh)."
+    ),
+    "accessories": (
+        "For a hoop, bangle, ring, or chain, describe the thickness of the "
+        "material AND its size relative to a visible body part it's worn "
+        "against or near (e.g. \"a hoop barely wider than the earlobe, "
+        "sitting tight against it\" vs \"a hoop hanging well past the "
+        "earlobe, several centimeters wide\"). For a headband, hairpin, "
+        "barrette, or other hair accessory, state how far it extends "
+        "across the head (e.g. \"a full headband spanning ear to ear\" vs "
+        "\"a small clip on one side only, a few centimeters wide\") and "
+        "where it sits (right at the hairline vs further back on the "
+        "crown). A vague adjective like \"small\" or \"large\" alone, "
+        "with nothing to compare it to, is not a usable size and leaves "
+        "the actual extent guessed. For glasses/eyewear, describe the "
+        "frame shape (round, square, cat-eye...), color/material, and "
+        "how thick or thin the frame is. If more than one accessory item "
+        "is visible (e.g. glasses worn together with a ring or a pin on "
+        "the frame), describe every one of them, not just the most "
+        "eye-catching one."
+    ),
+}
+
+
+def _outfit_source_options(max_images: int) -> list[str]:
+    """Same names as the `images` Autogrow's own sockets (`image_0`,
+    `image_1`...) — picking a source this way is a direct match against the
+    actual socket you connected, no separate 1-based/0-based numbering to
+    keep straight."""
+    return ["auto"] + [f"image_{i}" for i in range(max_images)]
+
+
+def _outfit_wanted_phrase(categories_here: list[tuple[str, str]]) -> str:
+    """English phrase for what this image should describe, e.g. "the top /
+    upper-body garment (...)" (front, the common case), "the back of the
+    footwear (...)" (back), or both joined when this image was assigned a
+    mix — grouped by view since a single photo is realistically all-front
+    or all-back (a camera can't shoot both sides of a person at once), even
+    though different categories can each come from a different photo.
+    """
+    front_cats = [c for c, v in categories_here if v == "front"]
+    back_cats = [c for c, v in categories_here if v == "back"]
+    parts = []
+    if front_cats:
+        parts.append("the " + _join_tags_english([_CATEGORY_PHRASES[c] for c in front_cats]))
+    if back_cats:
+        parts.append("the back of the " + _join_tags_english([_CATEGORY_PHRASES[c] for c in back_cats]))
+    return " and ".join(parts)
+
+
+def _outfit_system_prompt(base_prompt: str, categories_here: list[tuple[str, str]],
+                           categories_elsewhere: list[str]) -> str:
+    """Build this image's outfit system prompt given the category split.
+
+    `categories_here` is a list of `(category, view)` pairs assigned to
+    this specific image; `categories_elsewhere` is just category names
+    (view doesn't matter for exclusion — a category assigned to another
+    image, front or back, is skipped here either way).
+
+    No split at all (both empty) returns `base_prompt` verbatim — the
+    original, single generic outfit description.
+    """
+    if categories_here:
+        wanted = _outfit_wanted_phrase(categories_here)
+        cats_only = {c for c, _ in categories_here}
+        extra = " ".join(_CATEGORY_EXTRA_GUIDANCE[c] for c in cats_only if c in _CATEGORY_EXTRA_GUIDANCE)
+        extra_clause = f" {extra}" if extra else ""
+        return (
+            f"Describe {wanted} shown in the image. Skip everything else "
+            "the person is wearing, and skip hair. If it's ambiguous (e.g. a "
+            "thigh-high boot that looks like hosiery), describe it anyway "
+            f"rather than saying nothing is visible.{extra_clause} One short "
+            "sentence only, no explanation."
+        )
+    if categories_elsewhere:
+        skip = _join_tags_english([_CATEGORY_PHRASES[c] for c in categories_elsewhere])
+        base = base_prompt.strip()
+        if not base.endswith((".", "!", "?")):
+            base += "."
+        return (
+            f"{base} Skip the {skip} — already described from a different "
+            "reference photo; describe only what else this image shows of "
+            "the outfit."
+        )
+    return base_prompt
+
+
+def _outfit_fallback_prompt(categories_here: list[tuple[str, str]]) -> str:
+    """A bare-bones, no-frills version of the scoped prompt — used only when
+    the full scoped prompt (with its exclusion/ambiguity clauses) fails
+    outright after retries. Deliberately minimal: the more clauses a prompt
+    carries, the more this particular captioning model seems to misread one
+    of them as a reason to refuse (e.g. "don't mention any other category"
+    got read as "don't use category words at all", triggering a refusal on
+    the word "skirt"). Still scoped to `categories_here` — never the fully
+    generic whole-outfit prompt, which would throw away the category split
+    entirely and reintroduce the original conflicting-items problem.
+    """
+    return f"Describe {_outfit_wanted_phrase(categories_here)} shown in the image, in one short sentence."
+
 
 #: A genuine one-sentence physical/outfit description never contains any of
 #: these — catches refusals ("I can't fulfill this request...", "I apologize,
@@ -304,9 +546,23 @@ _REFUSAL_PATTERN = re.compile(
 )
 
 
+#: A genuine "very short, 1 sentence" description doesn't run this long or
+#: span this many paragraphs. A small captioning VLM given a longer,
+#: multi-clause system prompt (e.g. the category-scoped outfit prompts,
+#: which carry conditional "if X, you MUST..." instructions) can start
+#: reasoning out loud through the answer field instead of just answering —
+#: narrating the instructions back, working through the image, and only
+#: then giving a real sentence buried at the end. That text is neither
+#: empty nor a refusal, so it would otherwise sail past `_is_bad_output`
+#: and get used verbatim, garbled conclusion and all.
+_MAX_REASONABLE_LENGTH = 320
+
+
 def _is_bad_output(text: str) -> bool:
     text = text.strip()
-    return not text or bool(_REFUSAL_PATTERN.search(text))
+    if not text or bool(_REFUSAL_PATTERN.search(text)):
+        return True
+    return len(text) > _MAX_REASONABLE_LENGTH or text.count("\n") >= 2
 
 
 #: Small chat-tuned models occasionally echo the chat-template's own role
@@ -320,14 +576,65 @@ def _strip_role_leak(text: str) -> str:
 
 
 class H3LookSheetsDescribe(TextGenerate):
-    """Describe a Look Sheet reference photo in one sentence.
+    """Describe a Look Sheet reference photo (or several) in one sentence each.
 
     Wraps core's `TextGenerate` (same tokenize/generate/decode call, reused
     via `super().execute()`) with the fixed system prompt H3LookSheetsPrompt
     expects for whichever reference this is — `target=person` for <Picture
-    1>, `target=outfit` for <Picture 2>. One node per image, same as before,
-    just without a `PrimitiveStringMultiline` to keep in sync by hand.
+    1>, `target=outfit` for <Picture 2> onward.
+
+    `person` only ever needs `image_1` — a person reference is exactly one
+    photo. `outfit` can use several sockets (`image_1`, `image_2`...); each
+    is described separately, and `description` comes back as one JSON
+    string keyed by `target`, `{"outfit_1": "...", "outfit_2": "...", ...}`
+    (or `{"person_1": "..."}`) — never merged into one paragraph, so a set
+    of genuinely different outfits (or different pieces of the same look)
+    each keep their own description.
+
+    Wire `description` straight into H3LookSheetsPrompt/CustomPrompt's
+    `person_description`/`outfit_description` — those nodes unwrap this JSON
+    themselves and write one `<Picture N>` fragment per entry automatically.
+    To pull a single entry out for anything else, use core's "Extract Text
+    from JSON" node (`json_string` = this output, `key` = `"outfit_1"`,
+    `"outfit_2"`...).
+
+    Connect the images in the exact order you'll wire them, unchanged, into
+    MiniMaxH3ReferenceToVideo's ref_image sockets, right after the person's —
+    H3 numbers <Picture i> by connection order on that node, not by anything
+    this node can see.
+
+    `debug` is the second output — for every connected image, the exact
+    system prompt sent to the captioning VLM and its raw, unfiltered output
+    for every attempt (including retries), so a refusal, an empty decode, or
+    an unexpectedly-scoped category prompt can be diagnosed directly instead
+    of guessed at from the final `description` alone.
+
+    Choosing target=outfit reveals a source combo per garment category —
+    `top` and `bottom` each get an `..._image_front` and an `..._image_back`
+    (a top or a skirt/dress bottom can look different from behind), while
+    `shoes` and `accessories` get one plain `..._image` each (not worth
+    doubling for a back-of-the-shoe/bag detail). Each combo picks, by its
+    exact socket name (`image_0`, `image_1`...), which connected image is
+    the source. They default to "auto" and can be left alone entirely —
+    nothing changes unless at least one is set. Once one is set, every
+    connected image's prompt switches to an exclusion-aware one: an image
+    assigned a category (front or back, for top/bottom) is told to describe
+    *only* that category — and from the back specifically, when that's what
+    was assigned — while every other image is told to skip it, so two
+    outfit photos that both happen to show footwear never both end up
+    describing a pair of shoes in the final prompt. Set `..._back` only
+    when a distinct back-view photo exists and its design actually differs
+    from the front (e.g. a dress with a different back) — the resulting
+    text just becomes another entry in the JSON output, described from the
+    back; nothing here decides which video shot gets to use it.
     """
+
+    #: MiniMaxH3ReferenceToVideo caps ref_images at 9; one of those slots is
+    #: always the person, leaving at most 8 for the outfit. Matching that cap
+    #: here (rather than the tokenizer's own limit) keeps the two nodes'
+    #: maximums aligned so a maxed-out outfit here never overflows the wiring
+    #: downstream.
+    MAX_IMAGES = 9
 
     @classmethod
     def define_schema(cls):
@@ -335,17 +642,58 @@ class H3LookSheetsDescribe(TextGenerate):
         inputs = []
         for inp in parent.inputs:
             if inp.id == "prompt":
-                inputs.append(io.Combo.Input(
-                    "target", options=list(_DESCRIBE_SYSTEM_PROMPTS.keys()),
-                    tooltip="Which reference this image is: the person "
-                    "(<Picture 1>) or the outfit (<Picture 2>).",
+                def _outfit_field_tooltip(cat: str, view: str) -> str:
+                    source = (f"shows the {view} view of the {_CATEGORY_PHRASES[cat]}"
+                              if cat in _CATEGORIES_WITH_VIEW
+                              else f"is the source for the {_CATEGORY_PHRASES[cat]}")
+                    back_note = (" Only set `..._back` when a back-view photo exists and its "
+                                 "design differs from the front (e.g. a dress with a different "
+                                 "back)." if cat in _CATEGORIES_WITH_VIEW else "")
+                    return (
+                        f"Which connected outfit image {source} — same socket name as in "
+                        "`images` above (e.g. `image_0` is the first image socket). \"auto\" "
+                        "leaves this unassigned — harmless with a single outfit image, but "
+                        "with several, leaving every category at \"auto\" means each image "
+                        "just describes the whole outfit on its own, which can produce two "
+                        "conflicting items (e.g. two different pairs of shoes) if more than "
+                        f"one image shows the same category.{back_note}"
+                    )
+
+                target_options = [
+                    io.DynamicCombo.Option(key="person", inputs=[]),
+                    io.DynamicCombo.Option(key="outfit", inputs=[
+                        io.Combo.Input(
+                            _outfit_field_id(cat, view),
+                            options=_outfit_source_options(cls.MAX_IMAGES),
+                            default="auto", optional=True,
+                            tooltip=_outfit_field_tooltip(cat, view),
+                        )
+                        for cat in _OUTFIT_CATEGORIES
+                        for view in (_OUTFIT_VIEWS if cat in _CATEGORIES_WITH_VIEW else ["front"])
+                    ]),
+                ]
+                inputs.append(io.DynamicCombo.Input(
+                    "target", options=target_options, display_name="target",
+                    tooltip="Which reference these image(s) are: the person "
+                    "(<Picture 1>, always image_1 only) or the outfit "
+                    "(<Picture 2> onward — use image_2, image_3... for a "
+                    "look shown across several photos). Choosing outfit "
+                    "reveals per-category source fields below.",
                 ))
             elif inp.id == "image":
-                # Required here — there is nothing to describe without it,
-                # unlike bare TextGenerate which can run text-only.
-                inputs.append(io.Image.Input("image"))
+                inputs.append(io.Autogrow.Input(
+                    "images",
+                    tooltip="One photo per socket, described separately and "
+                    "joined in order. Connect these in the exact order "
+                    "you'll wire them into MiniMaxH3ReferenceToVideo's "
+                    "ref_image sockets.",
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Image.Input("image"),
+                        prefix="image_", min=1, max=cls.MAX_IMAGES,
+                    ),
+                ))
             elif inp.id in ("video", "audio"):
-                # This node only ever describes one still reference photo.
+                # This node only ever describes still reference photos.
                 continue
             else:
                 inputs.append(inp)
@@ -354,7 +702,17 @@ class H3LookSheetsDescribe(TextGenerate):
             display_name="Describe Reference (H3 Look Sheet)",
             category="H3LookSheets",
             inputs=inputs,
-            outputs=parent.outputs,
+            outputs=[
+                io.String.Output(display_name="description",
+                    tooltip='JSON object, one key per connected image, keyed by target: '
+                    '{"outfit_1": "...", "outfit_2": "...", ...}. Not merged — wire straight '
+                    'into H3LookSheetsPrompt/CustomPrompt, or pull one entry out with core\'s '
+                    '"Extract Text from JSON" node.'),
+                io.String.Output(display_name="debug",
+                    tooltip="Per connected image: the exact system prompt sent to the captioning "
+                    "VLM and its raw, unfiltered output for every attempt (including retries) — "
+                    "for diagnosing refusals, empty outputs, or unexpected category scoping."),
+            ],
         )
 
     #: Retried on: an empty decode (first sampled token landed on
@@ -365,20 +723,27 @@ class H3LookSheetsDescribe(TextGenerate):
     _RETRY_SEED_STRIDE = 104729  # an arbitrary large prime, just to jump seeds
 
     @classmethod
-    def execute(cls, clip, target, max_length, sampling_mode, image,
-                thinking=False, use_default_template=True) -> io.NodeOutput:
-        system_prompt = _DESCRIBE_SYSTEM_PROMPTS[target]
+    def _describe_one(cls, clip, system_prompt, target, max_length, sampling_mode,
+                       image, thinking, use_default_template) -> tuple[str, list[dict]]:
+        """Returns `(cleaned_text, attempts)` — `attempts` logs, for every
+        try (including retries), the seed used and the model's raw,
+        unfiltered output (before `_strip_role_leak`), for the `debug`
+        output."""
         mode = sampling_mode
         base_seed = mode.get("seed") if isinstance(mode, dict) else None
+        attempts: list[dict] = []
+        text = ""
 
         for attempt in range(cls.MAX_EMPTY_RETRIES + 1):
             out = super().execute(
                 clip, system_prompt, max_length, mode, image=image,
                 thinking=thinking, use_default_template=use_default_template,
             )
-            text = _strip_role_leak(out.args[0] if out.args else "")
+            raw = out.args[0] if out.args else ""
+            attempts.append({"attempt": attempt, "seed": mode.get("seed") if isinstance(mode, dict) else None, "raw": raw})
+            text = _strip_role_leak(raw)
             if not _is_bad_output(text):
-                return io.NodeOutput(text)
+                return text, attempts
             if base_seed is None or attempt == cls.MAX_EMPTY_RETRIES:
                 # No seed to vary (sampling is off), or retries exhausted.
                 break
@@ -387,16 +752,126 @@ class H3LookSheetsDescribe(TextGenerate):
             logging.warning(
                 "[H3LookSheetsDescribe] %s for target=%s (seed %s), "
                 "retrying with seed %s (attempt %d/%d)",
-                "empty output" if not text.strip() else "refusal",
+                "empty output" if not text.strip() else "refusal/too verbose",
                 target, base_seed, mode["seed"], attempt + 1, cls.MAX_EMPTY_RETRIES,
             )
 
-        if _is_bad_output(text):
-            logging.warning(
-                "[H3LookSheetsDescribe] still bad output for target=%s after "
-                "retries — check the image and system prompt.", target,
+        # Exhausted retries on this one image — skip it rather than fail the
+        # whole batch; the other images in the set still describe fine.
+        logging.warning(
+            "[H3LookSheetsDescribe] still bad output for target=%s after "
+            "retries — skipping this image.", target,
+        )
+        return "", attempts
+
+    @classmethod
+    def execute(cls, clip, target, max_length, sampling_mode, images,
+                thinking=False, use_default_template=True) -> io.NodeOutput:
+        target_key = target.get("target") if isinstance(target, dict) else target
+        base_prompt = _DESCRIBE_SYSTEM_PROMPTS[target_key]
+        ordered = [(key, img) for key, img in (images or {}).items() if img is not None]
+        if not ordered:
+            raise ValueError("H3LookSheetsDescribe needs at least one image")
+
+        # cat -> {"front": socket, "back": socket}. Keyed by the exact
+        # `images` socket name ("image_0", "image_1"...) — same names shown
+        # in the `..._image_front`/`..._image_back` combos, so a choice
+        # there matches a connected socket directly, no separate numbering
+        # to keep in sync.
+        category_assignment: dict[str, dict[str, str]] = {}
+        if target_key == "outfit" and isinstance(target, dict):
+            for cat in _OUTFIT_CATEGORIES:
+                for view in (_OUTFIT_VIEWS if cat in _CATEGORIES_WITH_VIEW else ["front"]):
+                    choice = target.get(_outfit_field_id(cat, view), "auto")
+                    if choice and choice != "auto":
+                        category_assignment.setdefault(cat, {})[view] = choice
+        # A category pointed at a socket that isn't currently connected (the
+        # image was disconnected/bypassed after the combo was set, shifting
+        # every later image_N down) is dropped rather than raised — it's a
+        # routine thing to hit while iterating on a workflow, and erroring
+        # the whole node over one stale combo is disproportionate. The
+        # image just falls back to describing whatever's left unassigned.
+        connected_keys = {key for key, _ in ordered}
+        for cat in list(category_assignment.keys()):
+            views = category_assignment[cat]
+            for view in list(views.keys()):
+                socket = views[view]
+                if socket not in connected_keys:
+                    logging.warning(
+                        "[H3LookSheetsDescribe] %s is set to \"%s\", but that socket isn't "
+                        "connected (connected: %s) — ignoring this assignment.",
+                        _outfit_field_id(cat, view), socket, sorted(connected_keys),
+                    )
+                    del views[view]
+            if not views:
+                del category_assignment[cat]
+
+        # Keyed by target + position among connected images ("outfit_0",
+        # "outfit_1"...), not the raw "image_N" socket id — a socket
+        # disconnected mid-list (e.g. image_2 unplugged while image_3 stays
+        # connected) would otherwise leave a gap ("outfit_0", "outfit_1",
+        # "outfit_3") instead of just shifting everything after it down by
+        # one, which is what H3LookSheetsPrompt/CustomPrompt's sequential
+        # <Picture N> numbering already assumes. Every connected socket
+        # keeps its key in the output, even one that fails after retries
+        # (empty string), so a downstream JSON lookup never has to guess
+        # which keys made it through.
+        descriptions = {}
+        debug_blocks = []
+        for position, (key, image) in enumerate(ordered):
+            categories_here = [(cat, view) for cat, views in category_assignment.items()
+                               for view, socket in views.items() if socket == key]
+            categories_elsewhere = sorted({
+                cat for cat, views in category_assignment.items()
+                if views and not any(socket == key for socket in views.values())
+            })
+            system_prompt = _outfit_system_prompt(base_prompt, categories_here, categories_elsewhere) \
+                if target_key == "outfit" else base_prompt
+            out_key = f"{target_key}_{position}"
+            text, attempts = cls._describe_one(
+                clip, system_prompt, target_key, max_length, sampling_mode,
+                image, thinking, use_default_template,
             )
-        return io.NodeOutput(text)
+            # The scoped prompt's own exclusion/ambiguity clauses can make
+            # the captioning VLM refuse outright, even after seed retries
+            # (one clause gets misread as a reason to refuse). Falling back
+            # to a bare, clause-free version of the SAME scoped prompt
+            # trades a bit of precision for actually getting a usable
+            # description — never the fully generic whole-outfit prompt,
+            # which would throw away the category split entirely and bring
+            # back the original conflicting-items problem this is meant to
+            # avoid.
+            if not text and categories_here:
+                logging.warning(
+                    "[H3LookSheetsDescribe] category-scoped prompt for %s (%s) produced no "
+                    "usable output after retries — retrying with a simpler scoped prompt "
+                    "for this image.", out_key,
+                    ", ".join(f"{cat}:{view}" for cat, view in categories_here),
+                )
+                text, fallback_attempts = cls._describe_one(
+                    clip, _outfit_fallback_prompt(categories_here), target_key, max_length,
+                    sampling_mode, image, thinking, use_default_template,
+                )
+                attempts += fallback_attempts
+            descriptions[out_key] = text
+
+            attempts_text = "\n".join(
+                f"  attempt {a['attempt']} (seed {a['seed']}): {a['raw']!r}" for a in attempts
+            )
+            debug_blocks.append(
+                f"=== {out_key} ({key}) ===\n"
+                f"--- system prompt ---\n{system_prompt}\n"
+                f"--- raw output(s) ---\n{attempts_text}"
+            )
+
+        debug = "\n\n".join(debug_blocks)
+
+        if not any(descriptions.values()):
+            logging.warning(
+                "[H3LookSheetsDescribe] every image failed for target=%s — "
+                "returning empty descriptions.", target_key,
+            )
+        return io.NodeOutput(json.dumps(descriptions, ensure_ascii=False), debug)
 
 
 # --------------------------------------------------------------------------
@@ -965,8 +1440,10 @@ class H3LookSheetsShotConfig:
 class H3LookSheetsCustomPrompt(io.ComfyNode):
     """Write H3's ref2va prompt for a custom, freely-shot-configured turnaround.
 
-    Same <Picture 1>/<Picture 2> identity+outfit logic as H3LookSheetsPrompt,
-    but the shot list itself is not fixed — each `shot_N` socket (fed by an
+    Same <Picture 1>/outfit-pictures identity+outfit logic as
+    H3LookSheetsPrompt, including automatic multi-image outfits from
+    H3LookSheetsDescribe's JSON output — see that class's docstring — but
+    the shot list itself is not fixed — each `shot_N` socket (fed by an
     H3LookSheetsShotConfig node) supplies its own angle, framing and
     expression, and however many are actually connected becomes the shot
     count (1 to 15). <Picture 1> is always anchored to whatever the first
@@ -1005,19 +1482,26 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
                 picture_1_gender=_AUTO_PRONOUN, picture_2_subject_type=_AUTO_PRONOUN,
                 backdrop="plain light neutral grey studio backdrop",
                 video_duration_seconds=5.0) -> io.NodeOutput:
+        person_items = [t.strip().rstrip(".") for t in _parse_multi_description(person_description) if t.strip()]
+        outfit_items = _fill_outfit_descriptions(_parse_multi_description(outfit_description))
+
         resolved_pronoun = (
-            _detect_pronoun(person_description)
+            _detect_pronoun(person_items[0] if person_items else "")
             if picture_1_gender == _AUTO_PRONOUN else picture_1_gender
         )
         p = _PRONOUNS.get(resolved_pronoun, _NEUTRAL_PRONOUN)
         resolved_subject_type = (
-            _detect_subject_type(outfit_description)
+            _detect_subject_type(" ".join(outfit_items))
             if picture_2_subject_type == _AUTO_PRONOUN else picture_2_subject_type
         )
         subject_noun = _SUBJECT_NOUNS.get(resolved_subject_type, _NEUTRAL_SUBJECT_NOUN)
-        person = person_description.strip().rstrip(".") or "the same figure"
-        outfit = outfit_description.strip().rstrip(".") or "the outfit shown"
+        person = person_items[0] if person_items else "the same figure"
         set_dressing = backdrop.strip().rstrip(".") or "plain light neutral grey studio backdrop"
+        outfit_tags = _picture_tags(2, len(outfit_items))
+        outfit_ref = _join_tags_english(outfit_tags)
+        outfit_fragment = ", ".join(
+            f"{text} from {tag}" for text, tag in zip(outfit_items, outfit_tags)
+        )
 
         parsed: list[tuple[str, str, str]] = []
         for value in (shots or {}).values():
@@ -1047,12 +1531,12 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
 
         header = (
             f"subject_definitions:\n<Subject 1> {person}, and the same figure "
-            f"and proportions established in <Picture 1>. {outfit} "
-            f"from the <Picture 2>, the garment tailored to {p['poss']} own "
+            f"and proportions established in <Picture 1>. {outfit_fragment}, "
+            f"the garment tailored to {p['poss']} own "
             "body shape and proportions from <Picture 1>, not the proportions "
-            "in <Picture 2>. <Picture 1> hairstyle is transferred to <Subject "
+            f"in {outfit_ref}. <Picture 1> hairstyle is transferred to <Subject "
             f"1> — none of the hair, hairstyle, or hair texture of "
-            f"{subject_noun} shown in <Picture 2> is carried over.\n"
+            f"{subject_noun} shown in {outfit_ref} is carried over.\n"
             "<Picture 1> is the first frame of [Shot 1], showing <Subject 1> "
             f"in {anchor_framing}, {anchor_angle}, with a {anchor_expression} "
             f"expression, against {set_dressing}."
@@ -1063,20 +1547,24 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"<Subject 1> in a {duration:g}-second sequence of "
             f"{total_shots} static shots, retaining only {p['poss']} hair, "
             "body shape, skin, and facial structure from <Picture 1>, while "
-            f"preserving the outfit from <Picture 2>. The background remains "
+            f"preserving the outfit from {outfit_ref}. The background remains "
             f"{set_dressing}. Framing, angle and expression change shot to "
             "shot as described below; pose is otherwise held still within "
             "each shot."
         )
 
+        outfit_retention = "\n".join(
+            f"{tag} (appears in {shot_tags}): partially_preserved - "
+            "retains only the outfit; no other visual elements or props "
+            "preserved."
+            for tag in outfit_tags
+        )
         retention = (
             "retention_analysis:\n"
             f"<Subject 1> (appears in {shot_tags}): partially_preserved - "
             "retains only hair, hairstyle, body shape, skin, and facial "
             "structure; no clothing or movement preserved.\n"
-            f"<Picture 2> (appears in {shot_tags}): partially_preserved - "
-            "retains only the outfit; no other visual elements or props "
-            "preserved."
+            f"{outfit_retention}"
         )
 
         # Same load-bearing stillness clause as H3LookSheetsPrompt — without
@@ -1089,8 +1577,12 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"crossing edges. {set_dressing[0].upper()}{set_dressing[1:]} "
             "and its bright, even lighting stay completely identical across "
             f"all {shots_word} shots. No text, watermark, logo, caption, or "
-            "writing of any kind appears anywhere in the video. Between every "
-            "shot, only the camera's position around <Subject 1> changes to "
+            "writing of any kind appears anywhere in the video. "
+            f"<Subject 1> wears the outfit and accessories from {outfit_ref} "
+            f"continuously from the very first frame through all {shots_word} "
+            "shots, without any garment changing, shifting, or being "
+            "removed. Between every shot, only the camera's position around "
+            "<Subject 1> changes to "
             "capture each new angle — <Subject 1> remains completely "
             "motionless throughout, holding one exact pose without turning, "
             "walking, gesturing, or otherwise moving between cuts, and hair "
@@ -1107,7 +1599,8 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             else:
                 opener = f"[Shot {i + 1}] At {at[i]}, the shot cuts to "
             shot_lines.append(
-                f"{opener}{framing_text} of <Subject 1>, {angle_text}, "
+                f"{opener}{framing_text} of <Subject 1>, wearing the outfit "
+                f"from {outfit_ref}, {angle_text}, "
                 f"with a {expr_text} expression."
             )
         detail = "detailed_description:\n" + intro + "\n" + "\n".join(shot_lines)
