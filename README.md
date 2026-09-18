@@ -11,7 +11,12 @@ Built around `MiniMaxH3ReferenceToVideo`: describe the two references, write
 the shot-by-shot prompt, generate, pick the frames worth keeping out of the
 rendered move, lay them out as one sheet.
 
-📺 [Demo video](https://www.youtube.com/watch?v=G1Gbli-9nFY)
+> **v1.1**: describe up to 8 outfit reference photos at once (front/back per
+> garment, up to 4 accessories), auto-detects the person's gender, and adds
+> an **Image Aggregator** node to route everything into
+> `MiniMaxH3ReferenceToVideo`'s 9 fixed reference slots.
+
+📺 [Demo videos](https://www.youtube.com/playlist?list=PLR0q7a2fnl5w)
 
 Person + outfit references in, look sheet out:
 
