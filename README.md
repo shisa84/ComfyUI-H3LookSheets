@@ -3,63 +3,93 @@
 Reference sheets of a person wearing a specific look, built on **MiniMax H3**'s
 multi-reference conditioning (`ref2va`).
 
-Two reference images go in — one of the person, one of the look (an outfit to
-start, with hairstyle, makeup and accessories planned) — and H3 renders that
-person, in that look, from every angle the sheet needs.
+Reference images go in — the person, and the look (an outfit, shown in one
+or several photos, with hairstyle, makeup and accessories planned) — and H3
+renders that person, in that look, from every angle the sheet needs.
 
-Built around `MiniMaxH3ReferenceToVideo`: describe the two references, write
+Built around `MiniMaxH3ReferenceToVideo`: describe the references, write
 the shot-by-shot prompt, generate, pick the frames worth keeping out of the
 rendered move, lay them out as one sheet.
 
-📺 [Demo video](https://www.youtube.com/watch?v=G1Gbli-9nFY)
+> **v1**: one person photo + one outfit photo, each captioned by **Describe
+> Reference**; a shot-by-shot prompt built from up to 15 **Shot Config**
+> nodes; **Select Frames** to pick the keepers out of the rendered take; and
+> **Datasheet Settings** to lay them out as one contact sheet.
+>
+> **v1.1**: describe up to 8 outfit reference photos at once (front/back per
+> garment, up to 4 accessories), auto-detects the person's gender, and adds
+> an **Image Aggregator** node to route everything into
+> `MiniMaxH3ReferenceToVideo`'s 9 fixed reference slots.
 
-Person + outfit references in, look sheet out:
+📺 [Demo videos](https://www.youtube.com/playlist?list=PLR0q7a2fnl5w)
+
+<details>
+<summary><b>v1</b> — person + outfit references in, look sheet out</summary>
 
 | Picture 1 — Person | Picture 2 — Outfit |
 |---|---|
-| ![Person reference](example_results/1_person.webp) | ![Outfit reference](example_results/1_outfit.webp) |
+| ![Person reference](example_results/1/1_person.webp) | ![Outfit reference](example_results/1/1_outfit.webp) |
 
-![Result look sheet](example_results/1_result.webp)
+![Result look sheet](example_results/1/1_result.webp)
+
+</details>
+
+<details open>
+<summary><b>v1.1</b> — person + outfit + accessories references in, look sheet out</summary>
+
+| Person (front/back) | Outfit (front/back) | Shoes | Glasses |
+|---|---|---|---|
+| ![Person reference](example_results/1.1/1.1_person_front_back.webp) | ![Outfit reference](example_results/1.1/1.1_outfit_front_back_nohair.webp) | ![Shoes reference](example_results/1.1/1.1_shoes.webp) | ![Glasses reference](example_results/1.1/1.1_glasses.webp) |
+
+![Result look sheet](example_results/1.1/1.1_result.webp)
+
+</details>
 
 ---
 
 ## The pipeline, node by node
 
-Each step feeds the next; only step 3 is a core ComfyUI/MiniMax H3 node, not
+Each step feeds the next; only step 5 is a core ComfyUI/MiniMax H3 node, not
 part of this pack.
 
-1. **Load the two reference photos** (`LoadImage` ×2 — one person, one look).
-2. **Describe each one** with a separate **Describe Reference** node
-   (`target=person` on the first photo, `target=outfit` on the second) →
-   `person_description` / `outfit_description`.
-3. **Write the prompt**: feed both descriptions into **Look Sheet Prompt**
-   (or `Shot Config` ×N → **Look Sheet Prompt - Custom Shots** for a freely
-   chosen shot list instead of the fixed 6-shot turnaround) → `prompt`.
-4. **Generate**: `prompt`, the two reference images, `clip`, `vae` and
-   `audio_vae` go into `MiniMaxH3ReferenceToVideo` (core node), then through
-   your usual sampler and VAE decode → a batch of decoded frames.
-5. **Pick the keepers**: the decoded frames go into **Select Frames** →
+1. **Load the reference photos** (`LoadImage` — the person, usually one
+   photo, and the look, one or several photos: front/back of a garment,
+   shoes, accessories…).
+2. **Describe them** with two **Describe Reference** nodes: `target=person`
+   with the person photo(s) on `image_0`, `image_1`…, `target=outfit` with the
+   outfit photo(s) → `description` (JSON, one entry per image) + `images`.
+3. **Route the images**: both `images` outputs go into **Image Aggregator**
+   (`images_person`, `images_outfit`) → `ref_image_0` … `ref_image_8`, in the
+   order the prompt numbers them.
+4. **Write the prompt**: both `description` outputs, plus `Shot Config` ×N for
+   however many shots the sheet needs, go into **Look Sheet Prompt - Custom
+   Shots** → `prompt`.
+5. **Generate**: `prompt`, the 9 `ref_image_N`, `clip`, `vae` and `audio_vae`
+   go into `MiniMaxH3ReferenceToVideo` (core node), then through your usual
+   sampler and VAE decode → a batch of decoded frames.
+6. **Pick the keepers**: the decoded frames go into **Select Frames** →
    `frames`.
-6. **Lay them out**: `frames` goes into **Datasheet Settings** → `sheet`
+7. **Lay them out**: `frames` goes into **Datasheet Settings** → `sheet`
    (IMAGE), the finished contact sheet.
 
 ```
-LoadImage (person) ─► Describe Reference (target=person) ─► person_description ─┐
-LoadImage (outfit) ─► Describe Reference (target=outfit) ─► outfit_description ─┤
-                                                                                  ▼
-                                                                     Look Sheet Prompt ─► prompt
-                                                                                  │
-                                                                                  ▼
-                                                                     MiniMaxH3ReferenceToVideo
-                                                                                  │
-                                                                                  ▼
-                                                                   sampler ─► VAE decode ─► decoded frames
-                                                                                  │
-                                                                                  ▼
-                                                                          Select Frames ─► frames
-                                                                                  │
-                                                                                  ▼
-                                                                       Datasheet Settings ─► sheet (IMAGE)
+LoadImage (person) ─► Describe Reference (target=person) ─► description ─────────┐
+                                        │ images                                  │
+LoadImage (outfit) ×N ─► Describe Reference (target=outfit) ─► description ──────┤
+                                        │ images                                  ▼
+                                        ▼                 Look Sheet Prompt - Custom Shots ─► prompt
+                                Image Aggregator ─► ref_image_0…8                 │
+                                        │                                         │
+                                        └──────────────► MiniMaxH3ReferenceToVideo ◄┘
+                                                                  │
+                                                                  ▼
+                                                   sampler ─► VAE decode ─► decoded frames
+                                                                  │
+                                                                  ▼
+                                                          Select Frames ─► frames
+                                                                  │
+                                                                  ▼
+                                                       Datasheet Settings ─► sheet (IMAGE)
 ```
 
 ---
@@ -68,51 +98,41 @@ LoadImage (outfit) ─► Describe Reference (target=outfit) ─► outfit_descr
 
 | Node | Category | What it does |
 |---|---|---|
-| **Look Sheet Prompt (H3)** | `H3LookSheets` | Fixed 6-shot, all-neutral turnaround prompt (`H3LookSheetsPrompt`) |
-| **Look Sheet Prompt - Custom Shots (H3)** | `H3LookSheets` | Same idea, but 1–15 freely described shots (`H3LookSheetsCustomPrompt`) |
+| **Look Sheet Prompt - Custom Shots (H3)** | `H3LookSheets` | Writes the ref2va prompt from a freely chosen list of 1–15 shots (`H3LookSheetsCustomPrompt`) |
 | **Shot Config (H3 Look Sheet)** | `H3LookSheets` | One shot's angle/framing/expression, packed for the node above (`H3LookSheetsShotConfig`) |
-| **Describe Reference (H3 Look Sheet)** | `H3LookSheets` | One-sentence vision description of a reference photo, with retry (`H3LookSheetsDescribe`) |
+| **Describe Reference (H3 Look Sheet)** | `H3LookSheets` | One-sentence vision description per reference photo (up to 8), with retry and fallback prompts (`H3LookSheetsDescribe`) |
+| **Image Aggregator (H3 Look Sheet)** | `H3LookSheets` | Routes the person and outfit images into `MiniMaxH3ReferenceToVideo`'s 9 `ref_image` slots (`H3ImageAggregator`) |
 | **Select Frames (H3 Look Sheet)** | `H3LookSheets` | Picks reference frames out of the rendered take (`H3LookSheetsSelectFrames`) |
 | **Datasheet Settings (H3 Look Sheet)** | `H3LookSheets` | Lays the picked frames out as one contact-sheet image (`H3LookSheetsDatasheetSettings`) |
 
 ---
 
-### Look Sheet Prompt (H3)
+### Look Sheet Prompt - Custom Shots (H3)
 
 Writes the `subject_definitions` / `summary` / `retention_analysis` /
 `detailed_description` prompt `MiniMaxH3ReferenceToVideo` expects, referencing
-`<Picture 1>` (the person) and `<Picture 2>` (the look) per H3's ref2va guide.
-Always 6 shots, always neutral: full body → face close-up → left profile →
-right profile → back → a second, wider medium close-up (chest-up).
+`<Picture 1>` (the person — or `<Picture 1>`, `<Picture 2>`... when the
+person is shown across several photos too) and the look, numbered right
+after however many person photos there were, per H3's ref2va guide.
+
+The shot list itself is not fixed. Up to 15 `shot_N` sockets (plug one, the
+next appears), each fed by a **Shot Config** node — however many are
+actually connected becomes the shot count.
+
+`person_description` / `outfit_description` take either plain text or
+**Describe Reference**'s JSON output directly: each JSON entry becomes its
+own `<Picture N>`, so the tags always match the images wired into
+`MiniMaxH3ReferenceToVideo` — person photo(s) first, then outfit photo(s). An
+outfit entry left empty (Describe gave up on that image) is kept as "the
+outfit shown" so the numbering never shifts.
 
 | Input | Type | Notes |
 |---|---|---|
 | `person_description` | STRING | From `Describe Reference` (`target=person`) or written by hand |
-| `outfit_description` | STRING | From `Describe Reference` (`target=outfit`) |
-| `picture_1_gender` | `auto` / `female` / `male` | Auto-detects from `person_description`'s wording; override when needed |
-| `picture_2_subject_type` | `auto` / `female` / `male` / `mannequin` | Who/what `<Picture 2>`'s original wearer is |
+| `outfit_description` | STRING | From `Describe Reference` (`target=outfit`) or written by hand |
+| `person_gender` | `auto` / `female` / `male` | Auto-detects from the first person description's wording; override when needed |
 | `backdrop` | STRING (multiline) | Default: plain light neutral grey studio backdrop |
-| `video_duration_seconds` | FLOAT | The take's real length — feed it from whatever sets `length` on `MiniMaxH3ReferenceToVideo`. Per-shot duration is `duration / 6`, truncated to one decimal |
-
-For expressions other than neutral, or a shot list that isn't this exact
-six, use **Look Sheet Prompt - Custom Shots** instead.
-
----
-
-### Look Sheet Prompt - Custom Shots (H3)
-
-Same `<Picture 1>`/`<Picture 2>` identity+outfit logic, but the shot list
-itself is not fixed. Up to 15 `shot_N` sockets (plug one, the next appears),
-each fed by a **Shot Config** node — however many are actually connected
-becomes the shot count. `<Picture 1>`/Shot 1 anchors to whatever the *first*
-connected shot describes.
-
-| Input | Type | Notes |
-|---|---|---|
-| `person_description` / `outfit_description` | STRING | Same as above |
-| `picture_1_gender` / `picture_2_subject_type` | Combo | Same as above |
-| `backdrop` | STRING (multiline) | Same as above |
-| `video_duration_seconds` | FLOAT | Same truncation rule, divided by however many shots are connected |
+| `video_duration_seconds` | FLOAT | The take's real length — feed it from whatever sets `length` on `MiniMaxH3ReferenceToVideo`, divided by however many shots are connected |
 | `shot_0` … `shot_14` | STRING (Autogrow) | Each fed by a **Shot Config** node |
 
 ### Shot Config (H3 Look Sheet)
@@ -140,17 +160,52 @@ selected by `target`:
 | `person` | Describe face, hair, eyes, skin, body shape; ignore outfit and clothes |
 | `outfit` | Describe the outfit and accessories only; skip hair |
 
-One node per reference photo. Plug its `generated_text` output straight into
-`person_description`/`outfit_description` on either prompt node above.
+One node per target. `images` is an Autogrow input (`image_0` … `image_7`,
+plug one, the next appears): the person is usually one photo, but can be
+several (e.g. front + back); the outfit can be shown across up to 8 photos.
+Connect them in the order they should reach `MiniMaxH3ReferenceToVideo`.
 
-Retries automatically (up to 3 times) on an empty reply, a refusal, or a
-leaked chat-template role tag. If every attempt fails, returns whatever the
-last attempt produced — check the output before trusting it downstream.
+| Output | Notes |
+|---|---|
+| `description` | JSON, one entry per connected image: `{"person_0": "..."}` or `{"outfit_0": "...", "outfit_1": "...", ...}`. Plug straight into `person_description`/`outfit_description` on **Look Sheet Prompt - Custom Shots** |
+| `debug` | Per image: the exact system prompt sent and every raw reply, retries included |
+| `images` | The connected images, same order as `description` — wire into **Image Aggregator** |
+
+With `target=outfit`, per-category combos appear to say which connected image
+is the source for what:
+
+| Combo | Use |
+|---|---|
+| `top_image_front` / `top_image_back` | Top, front and back view |
+| `bottom_image_front` / `bottom_image_back` | Bottom (skirt, trousers, dress bottom), front and back view |
+| `shoes_image` | Shoes |
+| `accessory_image_1` … `accessory_image_4` | Up to 4 distinct accessories, each from its own photo (e.g. glasses in one, a bag in another) |
+
+All default to `auto` (each image describes the whole outfit). As soon as
+one is set, each image describes only what it was assigned and skips what
+another image covers — so two photos that both show shoes don't produce two
+pairs. Set a `..._back` only when the back actually differs from the front.
+
+Retries automatically (up to 3 times, with a new seed) on an empty reply, a
+refusal, a leaked chat-template role tag, or — for an image assigned a
+category — a "there's none here" answer. If that still fails, one more try
+runs with a simpler fallback prompt; an image that still fails gets an empty
+entry, the others are kept.
 
 Inherited from `TextGenerate`: `max_length`, `sampling_mode` (on/off +
 temperature/top_k/top_p/seed/…), `thinking`, `use_default_template`. `video`
-and `audio` inputs are dropped — this node only ever describes one still
-image.
+and `audio` inputs are dropped — this node only describes still images.
+
+---
+
+### Image Aggregator (H3 Look Sheet)
+
+Concatenates `images_person`, `images_outfit`, `images_extra_1`,
+`images_extra_2` (each a single image or a list, e.g. **Describe Reference**'s
+`images` output), in that order, onto `ref_image_0` … `ref_image_8`. Wire all 9
+into `MiniMaxH3ReferenceToVideo`; unused slots come out empty and are skipped
+like a disconnected socket. Past 9 images, the rest are dropped with a
+warning. `images` returns the same images as one list.
 
 ---
 
