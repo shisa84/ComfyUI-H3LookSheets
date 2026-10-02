@@ -29,6 +29,14 @@ import torch.nn.functional as F
 from comfy_api.latest import io
 from comfy_extras.nodes_textgen import TextGenerate
 
+try:
+    # Only present on builds with the dynamic-VRAM "Comfy model compiler"
+    # (needs the comfy_aimdo/comfy_kitchen packages) — absent elsewhere, in
+    # which case there's no stale-graph cache to drop in the first place.
+    import comfy.model_prefetch as model_prefetch
+except ImportError:
+    model_prefetch = None
+
 #: English word for small shot counts (5 or 6 in practice) — reads naturally
 #: in the intro sentence ("across all six shots") instead of a bare digit.
 _COUNT_WORDS = {
@@ -446,6 +454,26 @@ def _strip_role_leak(text: str) -> str:
     return _LEADING_ROLE_TAG.sub("", text, count=1)
 
 
+#: comfy's dynamic-VRAM text generation (comfy/model_prefetch.py) captures a
+#: CUDA graph per transformer layer during a `generate()` call and replays it
+#: on the next one as long as the layer's weight-vbar signature still
+#: matches — but that check never looks at the KV-cache/embed shapes tied to
+#: *this* `generate()` call, only the weights. Describing a second image
+#: whose token count differs from the previous one's hits that stale graph:
+#: PyTorch replays it against buffers sized for the previous call, which can
+#: corrupt memory and crash the whole process ("scatter gather kernel index
+#: out of bounds"). We describe several images per node call, so dropping
+#: any cached graph before each one forces a fresh capture instead of a
+#: mismatched replay.
+def _drop_stale_cuda_graphs(clip) -> None:
+    if model_prefetch is None:
+        return
+    for module in clip.cond_stage_model.modules():
+        if hasattr(module, "_comfy_graph"):
+            model_prefetch._drop_graph(module)
+            model_prefetch.GRAPH_WARMED_MODULES.discard(module)
+
+
 class H3LookSheetsDescribe(TextGenerate):
     """Describe a Look Sheet reference photo (or several) in one sentence each.
 
@@ -639,6 +667,7 @@ class H3LookSheetsDescribe(TextGenerate):
         text = ""
 
         for attempt in range(cls.MAX_EMPTY_RETRIES + 1):
+            _drop_stale_cuda_graphs(clip)
             out = super().execute(
                 clip, system_prompt, max_length, mode, image=image,
                 thinking=thinking, use_default_template=use_default_template, mtp=mtp,
