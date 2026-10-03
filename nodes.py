@@ -1395,17 +1395,19 @@ class H3LookSheetsDatasheetSettings:
 # --------------------------------------------------------------------------
 # H3LookSheetsShotConfig / H3LookSheetsCustomPrompt
 #
-# Any number of shots (up to 15), each with its own angle, framing and
-# expression, instead of a hardcoded per-shot template.
+# Any number of shots (up to 15), each with its own angle, framing, camera
+# angle/height/target and expression, instead of a hardcoded per-shot
+# template.
 #
 # Autogrow (the "plug one, the next slot appears" mechanism) only works on
-# socket inputs, and forces every widget it wraps into one too — three
-# Autogrow'd combos per shot would mean 3x sockets and no ready-made node to
+# socket inputs, and forces every widget it wraps into one too — six
+# Autogrow'd combos per shot would mean 6x sockets and no ready-made node to
 # feed a bare combo value into a socket. H3LookSheetsShotConfig sidesteps
-# that: its own angle/framing/expression combos stay ordinary inline
-# widgets (it isn't itself using Autogrow), and it packs all three into one
-# string — so H3LookSheetsCustomPrompt only needs ONE Autogrow socket per
-# shot, fed by one of these nodes, not three.
+# that: its own angle/framing/camera angle/camera height/camera target/
+# expression combos stay ordinary inline widgets (it isn't itself using
+# Autogrow), and it packs all six into one string — so
+# H3LookSheetsCustomPrompt only needs ONE Autogrow socket per shot, fed by
+# one of these nodes, not six.
 # --------------------------------------------------------------------------
 
 _ANGLE_PHRASES = {
@@ -1416,18 +1418,23 @@ _ANGLE_PHRASES = {
     "right profile": "turned to show the right profile",
     "back 3/4 left": "turned mostly away, seen three-quarters from the back on the left side",
     "back 3/4 right": "turned mostly away, seen three-quarters from the back on the right side",
-    "back": "facing away from the camera, back to camera",
+    "back": "facing away from the camera, back to camera — a rear view",
 }
 _ANGLE_OPTIONS = list(_ANGLE_PHRASES.keys())
 
+#: Pure zoom level/field of view — how tight the shot is, independent of
+#: which body part it's actually on. That's `camera_target`'s job (below):
+#: "close-up" alone doesn't say close-up on what, and used to hardcode
+#: "shoulders/face" into the name, which fought `camera_target` whenever
+#: it pointed anywhere else (e.g. a close-up aimed at the legs).
 _FRAMING_PHRASES = {
     "extreme wide shot": "an extreme wide shot",
-    "wide shot (full body)": "a full-body wide shot, the entire figure visible from head to toe",
-    "medium wide shot (knees-up)": "a medium-wide shot from the knees up",
-    "medium shot (waist-up)": "a medium shot from the waist up",
-    "medium close-up (chest-up)": "a medium close-up from the chest up",
-    "close-up (shoulders/face)": "a close-up of the shoulders and face",
-    "extreme close-up (eyes/detail)": "an extreme close-up on the eyes and fine detail",
+    "wide shot": "a wide shot",
+    "medium wide shot": "a medium-wide shot",
+    "medium shot": "a medium shot",
+    "medium close-up": "a medium close-up",
+    "close-up": "a close-up",
+    "extreme close-up": "an extreme close-up",
 }
 _FRAMING_OPTIONS = list(_FRAMING_PHRASES.keys())
 
@@ -1450,8 +1457,74 @@ _EXPRESSION_PHRASES = {
 }
 _EXPRESSION_OPTIONS = list(_EXPRESSION_PHRASES.keys())
 
-#: Separator packed between the three combo values — chosen because none of
-#: the option strings above contain it, so splitting is unambiguous.
+#: Vertical shooting angle — how the camera looks at <Subject 1>, independent
+#: of the body turn above (horizontal, camera-left/right). Takes `{target}`
+#: (see _CAMERA_TARGET_PHRASES below): a camera's height and tilt alone
+#: don't say what it's pointed at, and "bird's eye view" of the feet reads
+#: completely differently from "bird's eye view" of the face.
+#:
+#: Phrased as a short, concrete physical description (where the camera
+#: sits, which way it's tilted) rather than a photography term alone — a
+#: longer, more insistent version of this text (explaining the resulting
+#: perspective distortion, spelling out what the camera does *not* do)
+#: drowned out this same shot's own `angle` instead of helping. It's also
+#: silent on what's visible in frame — that's `framing`'s job; a template
+#: presuming a wide/full-body crop here would contradict a tight `framing`
+#: (e.g. "extreme close-up" + "seen entirely from above" in one sentence).
+#:
+#: No "worm's eye view" (camera on the ground looking up): tried a plain
+#: label, a long physical description, and a short one, and H3 never
+#: actually moves the camera there — at best it fakes the "looking up"
+#: read by tilting <Subject 1>'s head back instead, breaking the "pose
+#: held still" constraint for a result that isn't what was asked for
+#: either. "bird's eye view" (looking down) works fine — H3 just doesn't
+#: seem to have learned this one direction.
+_CAMERA_ANGLE_TEMPLATES = {
+    "eye level": "the camera held level with {target}",
+    "low angle": "the camera positioned below {target}, tilted upward toward it — a low-angle shot",
+    "high angle": "the camera positioned above {target}, tilted downward toward it — a high-angle shot",
+    "bird's eye view": "the camera directly overhead, high above <Subject 1>, looking straight down at {target} — an extreme high-angle bird's-eye view",
+    "worm's eye view": "the camera on the ground, close to the floor, tilted upward toward {target} — an extreme low-angle worm's-eye view",
+}
+_CAMERA_ANGLE_OPTIONS = list(_CAMERA_ANGLE_TEMPLATES.keys())
+
+#: "bird's eye view"/"worm's eye view" already hardcode a height into their
+#: template text above (directly overhead / on the ground) — pairing either
+#: with a `camera_height` other than that is a straight contradiction (e.g.
+#: "bird's eye view" + "chest height"), so camera_height is skipped entirely
+#: for them rather than left for the user to contradict.
+_CAMERA_ANGLE_FIXED_HEIGHT = {"bird's eye view", "worm's eye view"}
+
+#: Where the camera physically sits along <Subject 1>'s body — distinct from
+#: the angle above: a chest-height camera can still shoot level, low, or
+#: high depending on which way it's tilted.
+_CAMERA_HEIGHT_PHRASES = {
+    "ground level": "positioned at ground level",
+    "knee height": "positioned at knee height",
+    "waist height": "positioned at waist height",
+    "chest height": "positioned at chest height",
+    "eye level": "positioned at eye level",
+    "overhead": "positioned above <Subject 1>'s head",
+}
+_CAMERA_HEIGHT_OPTIONS = list(_CAMERA_HEIGHT_PHRASES.keys())
+
+#: What the camera is actually pointed at — fills `{target}` in the angle
+#: templates above, and also what `framing`'s zoom level is actually zoomed
+#: in on (see note above _FRAMING_PHRASES) — a close-up can be on the face
+#: or on the legs, and that choice belongs here, not in `framing` itself.
+_CAMERA_TARGET_PHRASES = {
+    "whole body": "<Subject 1>",
+    "lower legs": "<Subject 1>'s lower legs",
+    "upper legs": "<Subject 1>'s upper legs",
+    "waist": "<Subject 1>'s waist",
+    "chest": "<Subject 1>'s chest",
+    "face": "<Subject 1>'s face",
+    "eyes": "<Subject 1>'s eyes",
+}
+_CAMERA_TARGET_OPTIONS = list(_CAMERA_TARGET_PHRASES.keys())
+
+#: Separator packed between the combo values — chosen because none of the
+#: option strings above contain it, so splitting is unambiguous.
 _SHOT_CONFIG_SEP = "||"
 
 #: How many shot_N sockets H3LookSheetsCustomPrompt exposes at once.
@@ -1459,10 +1532,17 @@ _MAX_CUSTOM_SHOTS = 15
 
 
 class H3LookSheetsShotConfig:
-    """One shot's angle, framing and expression, packed into one string.
+    """One shot's angle, framing, camera angle/height/target and expression,
+    packed into one string.
+
+    `camera_angle` and `camera_height` describe the camera's own position
+    (tilted up/down, how high off the ground); `camera_target` says what
+    body part it's actually pointed at — needed to keep the two coherent
+    (e.g. a bird's-eye view only reads as one when it's aimed at something
+    below the camera, like the chest, not the eyes it's already level with).
 
     Feeds a single `shot_N` socket on H3LookSheetsCustomPrompt — see the
-    module note above for why this exists instead of three plain combos.
+    module note above for why this exists instead of six plain combos.
     """
 
     @classmethod
@@ -1471,6 +1551,9 @@ class H3LookSheetsShotConfig:
             "required": {
                 "angle": (_ANGLE_OPTIONS,),
                 "framing": (_FRAMING_OPTIONS,),
+                "camera_angle": (_CAMERA_ANGLE_OPTIONS,),
+                "camera_height": (_CAMERA_HEIGHT_OPTIONS,),
+                "camera_target": (_CAMERA_TARGET_OPTIONS,),
                 "expression": (_EXPRESSION_OPTIONS,),
             },
         }
@@ -1480,8 +1563,10 @@ class H3LookSheetsShotConfig:
     FUNCTION = "build"
     CATEGORY = "H3LookSheets"
 
-    def build(self, angle, framing, expression):
-        return (_SHOT_CONFIG_SEP.join((angle, framing, expression)),)
+    def build(self, angle, framing, camera_angle, camera_height, camera_target, expression):
+        return (_SHOT_CONFIG_SEP.join(
+            (angle, framing, camera_angle, camera_height, camera_target, expression)
+        ),)
 
 
 class H3LookSheetsCustomPrompt(io.ComfyNode):
@@ -1497,11 +1582,12 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
     matches how many entries were in it, no separate count input needed.
 
     The shot list itself is not fixed — each `shot_N` socket (fed by an
-    H3LookSheetsShotConfig node) supplies its own angle, framing and
-    expression, and however many are actually connected becomes the shot
-    count (1 to 15). <Picture 1> is always anchored to whatever the first
-    connected shot describes, so the header stays consistent with it even
-    when shot 1 isn't the usual full-body/front/neutral default.
+    H3LookSheetsShotConfig node) supplies its own angle, framing, camera
+    angle/height/target and expression, and however many are actually
+    connected becomes the shot count (1 to 15). <Picture 1> is always
+    anchored to whatever the first connected shot describes, so the header
+    stays consistent with it even when shot 1 isn't the usual
+    full-body/front/eye-level/neutral default.
     """
 
     @classmethod
@@ -1560,14 +1646,14 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{text} from {tag}" for text, tag in zip(outfit_items, outfit_tags)
         )
 
-        parsed: list[tuple[str, str, str]] = []
+        parsed: list[tuple[str, str, str, str, str, str]] = []
         for value in (shots or {}).values():
             if not value:
                 continue
             parts = value.split(_SHOT_CONFIG_SEP)
-            if len(parts) != 3:
+            if len(parts) != 6:
                 continue
-            parsed.append((parts[0], parts[1], parts[2]))
+            parsed.append(tuple(parts))
 
         total_shots = max(1, len(parsed))
         duration = float(video_duration_seconds)
@@ -1602,8 +1688,11 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         outfit_retention = "\n".join(
             f"{tag} (appears in {shot_tags}): partially_preserved - "
             "retains only the outfit; hair, hairstyle, and hair texture of "
-            f"{subject_noun} shown here are not preserved; no other visual "
-            "elements or props preserved."
+            f"{subject_noun} shown here are not preserved; this photo's own "
+            "camera angle and pose are not preserved either — every shot "
+            "uses its own angle and pose from the list below, never the "
+            "angle or pose this reference photo happens to be shot in; no "
+            "other visual elements or props preserved."
             for tag in outfit_tags
         )
         retention = (
@@ -1614,10 +1703,26 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{outfit_retention}"
         )
 
-        # The explicit "only the camera moves, hair stays at rest" clause is
-        # load-bearing: without it H3 tends to render windswept/flying hair
-        # between cuts, as if carrying motion over from a turn that never
-        # actually happened.
+        # The explicit "hair stays at rest" clause is load-bearing: without
+        # it H3 tends to render windswept/flying hair between cuts, as if
+        # carrying motion over from a turn that never actually happened.
+        # The intro used to describe the camera "repositioning... to capture
+        # each new shot" — continuous travel wording — while every shot
+        # below is introduced as "a hard cut". That mismatch (continuous
+        # camera move vs. instant cut) read as conflicting motion signals
+        # and showed up as residual drift/sway instead of a clean stop
+        # between shots, so the intro now describes instant cuts to a new,
+        # fixed camera position, never movement. Height/tilt wording is
+        # spelled out here too since a shot can set camera_angle/
+        # camera_height — without it H3 defaults back to eye level.
+        # The within-shot stillness clause is separate from the hard-cut
+        # wording above: that one stops the camera from drifting *between*
+        # shots, this one stops it from creeping up/down *within* a single
+        # shot. First tried as a list of negated verbs ("does not rise,
+        # sink, drift, pan, tilt, or zoom") — that made the drift worse, not
+        # better, likely because naming the motions (even negated) cues H3
+        # toward them. Positive, static-only wording ("tripod-mounted",
+        # "locked-off") reads as still without naming any motion at all.
         intro = (
             f"The target video uses a static studio lighting setup against "
             f"{set_dressing}. All shots are framed with generous empty "
@@ -1632,27 +1737,38 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             "shots, without any garment changing, shifting, or being "
             f"removed. <Subject 1>'s hair, hairstyle, and haircut come from "
             f"{person_ref} and stay identical across all {shots_word} shots. "
-            "Between every shot, only the camera's position around "
-            "<Subject 1> changes to "
-            "capture each new angle — <Subject 1> remains completely "
-            "motionless throughout, holding one exact pose without turning, "
-            "walking, gesturing, or otherwise moving between cuts, and hair "
-            "stays at rest in that pose, undisturbed by any camera movement."
+            "Each shot is an instant hard cut to a new camera position and "
+            "angle around <Subject 1> — closer or farther, higher or "
+            "lower, tilted up or down. Within each shot, the camera is a "
+            "single static, locked-off shot, as if mounted on a tripod: "
+            "completely still from the first frame of the shot to the "
+            "last, right up to the next hard cut. <Subject 1> remains "
+            "completely motionless throughout, holding one exact pose "
+            "without turning, walking, gesturing, or otherwise moving "
+            "between cuts, and hair stays at rest in that pose between cuts."
         )
 
         shot_lines = []
-        for i, (angle, framing, expression) in enumerate(parsed):
+        for i, (angle, framing, camera_angle, camera_height, camera_target, expression) in enumerate(parsed):
             framing_text = _FRAMING_PHRASES.get(framing, framing)
             angle_text = _ANGLE_PHRASES.get(angle, angle)
+            target_text = _CAMERA_TARGET_PHRASES.get(camera_target, camera_target)
+            angle_template = _CAMERA_ANGLE_TEMPLATES.get(camera_angle)
+            camera_angle_text = (
+                angle_template.format(target=target_text) if angle_template is not None else camera_angle
+            )
             expr_text = _EXPRESSION_PHRASES.get(expression, expression)
             if i == 0:
                 opener = "[Shot 1] "
             else:
-                opener = f"[Shot {i + 1}] At {at[i]}, the shot cuts to "
+                opener = f"[Shot {i + 1}] At {at[i]}, a hard cut to "
+            camera_text = camera_angle_text
+            if camera_angle not in _CAMERA_ANGLE_FIXED_HEIGHT:
+                camera_text += f", {_CAMERA_HEIGHT_PHRASES.get(camera_height, camera_height)}"
             shot_lines.append(
-                f"{opener}{framing_text} of <Subject 1>, wearing the outfit "
-                f"from {outfit_ref}, {angle_text}, "
-                f"with a {expr_text} expression."
+                f"{opener}{framing_text} of {target_text}, wearing the outfit "
+                f"from {outfit_ref}, {angle_text}, {camera_text}, a static, "
+                f"locked-off shot, with a {expr_text} expression."
             )
         detail = "detailed_description:\n" + intro + "\n" + "\n".join(shot_lines)
 
@@ -1663,6 +1779,76 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         return io.NodeOutput(prompt)
 
 
+#: Rendered by web/h3looksheets_prompt_view.js; the value is JSON:
+#: {"override": bool, "text": str}. `text` is only meaningful while
+#: `override` is true — the editor seeds it from the latest `prompt` input
+#: the first time the user turns override on.
+PromptViewState = io.Custom("H3LOOKSHEETS_PROMPT_VIEW")
+
+
+class H3LookSheetsPromptView(io.ComfyNode):
+    """Preview a prompt's H3 tag syntax (`<Picture N>`, `<Subject N>`,
+    `<Audio N>`, `[Shot N]`, section headers) colorized, with a one-click
+    copy button, before it reaches MiniMaxH3ReferenceToVideo.
+
+    Read-only by default and always mirrors `prompt`. Clicking "Override
+    prompt" unlocks the text for editing in place and switches the output
+    to that edited copy instead; clicking it again drops the edit and goes
+    back to mirroring `prompt`.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="H3LookSheetsPromptView",
+            display_name="Prompt View (H3 Look Sheet)",
+            category="H3LookSheets",
+            inputs=[
+                io.String.Input("prompt", force_input=True),
+                PromptViewState.Input("view_state"),
+            ],
+            outputs=[io.String.Output(display_name="prompt")],
+        )
+
+    @classmethod
+    def execute(cls, prompt, view_state=None) -> io.NodeOutput:
+        state = json.loads(view_state) if view_state else {}
+        text = state.get("text", "") if state.get("override") else prompt
+        # Echoed back so the widget can refresh its read-only mirror of
+        # `prompt` without the node needing to re-run on its own.
+        return io.NodeOutput(text, ui={"h3looksheets_prompt": [prompt]})
+
+
+class H3LookSheetsRefImageSize:
+    """A `match`/`max` picker for MiniMax H3's `ref_image_size`, output as a
+    real COMBO (not STRING).
+
+    ComfyUI only lets a COMBO-typed socket connect to another COMBO-typed
+    socket — a generic passthrough node (Set/Get, reroute-style) declared
+    with a wildcard type does count (wildcards match anything), but a plain
+    STRING output does not (exact type match required once neither side is
+    a wildcard). Declaring RETURN_TYPES as a list, the same way Impact
+    Pack's ImpactSchedulerAdapter does for its scheduler output, keeps this
+    a real COMBO end to end so it survives a Set/Get pair.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ref_image_size": (["match", "max"],),
+            },
+        }
+
+    RETURN_TYPES = (["match", "max"],)
+    RETURN_NAMES = ("ref_image_size",)
+    FUNCTION = "choose"
+    CATEGORY = "H3LookSheets"
+
+    def choose(self, ref_image_size):
+        return (ref_image_size,)
+
+
 NODE_CLASS_MAPPINGS = {
     "H3LookSheetsDescribe": H3LookSheetsDescribe,
     "H3ImageAggregator": H3ImageAggregator,
@@ -1670,6 +1856,8 @@ NODE_CLASS_MAPPINGS = {
     "H3LookSheetsDatasheetSettings": H3LookSheetsDatasheetSettings,
     "H3LookSheetsShotConfig": H3LookSheetsShotConfig,
     "H3LookSheetsCustomPrompt": H3LookSheetsCustomPrompt,
+    "H3LookSheetsPromptView": H3LookSheetsPromptView,
+    "H3LookSheetsRefImageSize": H3LookSheetsRefImageSize,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1679,4 +1867,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3LookSheetsDatasheetSettings": "Datasheet Settings (H3 Look Sheet)",
     "H3LookSheetsShotConfig": "Shot Config (H3 Look Sheet)",
     "H3LookSheetsCustomPrompt": "Look Sheet Prompt - Custom Shots (H3)",
+    "H3LookSheetsPromptView": "Prompt View (H3 Look Sheet)",
+    "H3LookSheetsRefImageSize": "Ref Image Size (match/max)",
 }

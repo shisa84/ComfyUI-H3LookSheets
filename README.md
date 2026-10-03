@@ -102,6 +102,8 @@ LoadImage (outfit) ×N ─► Describe Reference (target=outfit) ─► descript
 | **Shot Config (H3 Look Sheet)** | `H3LookSheets` | One shot's angle/framing/expression, packed for the node above (`H3LookSheetsShotConfig`) |
 | **Describe Reference (H3 Look Sheet)** | `H3LookSheets` | One-sentence vision description per reference photo (up to 8), with retry and fallback prompts (`H3LookSheetsDescribe`) |
 | **Image Aggregator (H3 Look Sheet)** | `H3LookSheets` | Routes the person and outfit images into `MiniMaxH3ReferenceToVideo`'s 9 `ref_image` slots (`H3ImageAggregator`) |
+| **Prompt View (H3 Look Sheet)** | `H3LookSheets` | Colorized read-only preview of a prompt, with a copy button and an edit-a-copy override (`H3LookSheetsPromptView`) |
+| **Ref Image Size (match/max)** | `H3LookSheets` | A `match`/`max` picker for `MiniMaxH3ReferenceToVideo`'s `ref_image_size`, output as a real combo so it survives a Set/Get pair (`H3LookSheetsRefImageSize`) |
 | **Select Frames (H3 Look Sheet)** | `H3LookSheets` | Picks reference frames out of the rendered take (`H3LookSheetsSelectFrames`) |
 | **Datasheet Settings (H3 Look Sheet)** | `H3LookSheets` | Lays the picked frames out as one contact-sheet image (`H3LookSheetsDatasheetSettings`) |
 
@@ -206,6 +208,36 @@ Concatenates `images_person`, `images_outfit`, `images_extra_1`,
 into `MiniMaxH3ReferenceToVideo`; unused slots come out empty and are skipped
 like a disconnected socket. Past 9 images, the rest are dropped with a
 warning. `images` returns the same images as one list.
+
+---
+
+### Prompt View (H3 Look Sheet)
+
+A preview of the prompt right before it reaches `MiniMaxH3ReferenceToVideo`:
+`<Picture N>`, `<Subject N>`, `<Audio N>`, `[Shot N]` and the section headers
+(`subject_definitions`, `summary`, `retention_analysis`,
+`detailed_description`, `overall_soundscape`, `non_diegetic_music`) are
+colorized, and a **Copy** button copies the text shown.
+
+Read-only by default, always mirroring whatever is wired into `prompt`.
+**Override prompt** unlocks it for editing a copy in place — the node then
+outputs that edited copy instead, until **Revert to original** is clicked to
+go back to mirroring `prompt` again.
+
+| | |
+|---|---|
+| Input | `prompt` (STRING, force input) — wire it from **Look Sheet Prompt - Custom Shots** or anywhere else a prompt string comes from |
+| Output | `prompt` (STRING) — the edited copy while overridden, otherwise the input unchanged |
+
+---
+
+### Ref Image Size (match/max)
+
+A dropdown for `MiniMaxH3ReferenceToVideo`'s `ref_image_size` (`match` /
+`max`), with a real combo output — so it can be routed through a KJNodes
+Set/Get pair to drive several `MiniMaxH3ReferenceToVideo` nodes from one
+place. A plain `Primitive` or `STRING` node cannot connect to a combo input;
+this node can.
 
 ---
 
