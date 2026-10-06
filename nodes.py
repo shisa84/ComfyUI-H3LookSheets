@@ -1480,7 +1480,7 @@ _EXPRESSION_OPTIONS = list(_EXPRESSION_PHRASES.keys())
 #: either. "bird's eye view" (looking down) works fine — H3 just doesn't
 #: seem to have learned this one direction.
 _CAMERA_ANGLE_TEMPLATES = {
-    "eye level": "the camera held level with {target}",
+    "level angle": "the camera held level with {target}",
     "low angle": "the camera positioned below {target}, tilted upward toward it — a low-angle shot",
     "high angle": "the camera positioned above {target}, tilted downward toward it — a high-angle shot",
     "bird's eye view": "the camera directly overhead, high above <Subject 1>, looking straight down at {target} — an extreme high-angle bird's-eye view",
