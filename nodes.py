@@ -1396,18 +1396,16 @@ class H3LookSheetsDatasheetSettings:
 # H3LookSheetsShotConfig / H3LookSheetsCustomPrompt
 #
 # Any number of shots (up to 15), each with its own angle, framing, camera
-# angle/height/target and expression, instead of a hardcoded per-shot
-# template.
+# target and expression, instead of a hardcoded per-shot template.
 #
 # Autogrow (the "plug one, the next slot appears" mechanism) only works on
-# socket inputs, and forces every widget it wraps into one too — six
-# Autogrow'd combos per shot would mean 6x sockets and no ready-made node to
+# socket inputs, and forces every widget it wraps into one too — four
+# Autogrow'd combos per shot would mean 4x sockets and no ready-made node to
 # feed a bare combo value into a socket. H3LookSheetsShotConfig sidesteps
-# that: its own angle/framing/camera angle/camera height/camera target/
-# expression combos stay ordinary inline widgets (it isn't itself using
-# Autogrow), and it packs all six into one string — so
-# H3LookSheetsCustomPrompt only needs ONE Autogrow socket per shot, fed by
-# one of these nodes, not six.
+# that: its own angle/framing/camera target/expression combos stay ordinary
+# inline widgets (it isn't itself using Autogrow), and it packs all four
+# into one string — so H3LookSheetsCustomPrompt only needs ONE Autogrow
+# socket per shot, fed by one of these nodes, not four.
 # --------------------------------------------------------------------------
 
 _ANGLE_PHRASES = {
@@ -1457,61 +1455,18 @@ _EXPRESSION_PHRASES = {
 }
 _EXPRESSION_OPTIONS = list(_EXPRESSION_PHRASES.keys())
 
-#: Vertical shooting angle — how the camera looks at <Subject 1>, independent
-#: of the body turn above (horizontal, camera-left/right). Takes `{target}`
-#: (see _CAMERA_TARGET_PHRASES below): a camera's height and tilt alone
-#: don't say what it's pointed at, and "bird's eye view" of the feet reads
-#: completely differently from "bird's eye view" of the face.
+#: What the camera is actually pointed at — also what `framing`'s zoom
+#: level is actually zoomed in on (see note above _FRAMING_PHRASES) — a
+#: close-up can be on the face or on the legs, and that choice belongs
+#: here, not in `framing` itself.
 #:
-#: Phrased as a short, concrete physical description (where the camera
-#: sits, which way it's tilted) rather than a photography term alone — a
-#: longer, more insistent version of this text (explaining the resulting
-#: perspective distortion, spelling out what the camera does *not* do)
-#: drowned out this same shot's own `angle` instead of helping. It's also
-#: silent on what's visible in frame — that's `framing`'s job; a template
-#: presuming a wide/full-body crop here would contradict a tight `framing`
-#: (e.g. "extreme close-up" + "seen entirely from above" in one sentence).
-#:
-#: No "worm's eye view" (camera on the ground looking up): tried a plain
-#: label, a long physical description, and a short one, and H3 never
-#: actually moves the camera there — at best it fakes the "looking up"
-#: read by tilting <Subject 1>'s head back instead, breaking the "pose
-#: held still" constraint for a result that isn't what was asked for
-#: either. "bird's eye view" (looking down) works fine — H3 just doesn't
-#: seem to have learned this one direction.
-_CAMERA_ANGLE_TEMPLATES = {
-    "level angle": "the camera held level with {target}",
-    "low angle": "the camera positioned below {target}, tilted upward toward it — a low-angle shot",
-    "high angle": "the camera positioned above {target}, tilted downward toward it — a high-angle shot",
-    "bird's eye view": "the camera directly overhead, high above <Subject 1>, looking straight down at {target} — an extreme high-angle bird's-eye view",
-    "worm's eye view": "the camera on the ground, close to the floor, tilted upward toward {target} — an extreme low-angle worm's-eye view",
-}
-_CAMERA_ANGLE_OPTIONS = list(_CAMERA_ANGLE_TEMPLATES.keys())
-
-#: "bird's eye view"/"worm's eye view" already hardcode a height into their
-#: template text above (directly overhead / on the ground) — pairing either
-#: with a `camera_height` other than that is a straight contradiction (e.g.
-#: "bird's eye view" + "chest height"), so camera_height is skipped entirely
-#: for them rather than left for the user to contradict.
-_CAMERA_ANGLE_FIXED_HEIGHT = {"bird's eye view", "worm's eye view"}
-
-#: Where the camera physically sits along <Subject 1>'s body — distinct from
-#: the angle above: a chest-height camera can still shoot level, low, or
-#: high depending on which way it's tilted.
-_CAMERA_HEIGHT_PHRASES = {
-    "ground level": "positioned at ground level",
-    "knee height": "positioned at knee height",
-    "waist height": "positioned at waist height",
-    "chest height": "positioned at chest height",
-    "eye level": "positioned at eye level",
-    "overhead": "positioned above <Subject 1>'s head",
-}
-_CAMERA_HEIGHT_OPTIONS = list(_CAMERA_HEIGHT_PHRASES.keys())
-
-#: What the camera is actually pointed at — fills `{target}` in the angle
-#: templates above, and also what `framing`'s zoom level is actually zoomed
-#: in on (see note above _FRAMING_PHRASES) — a close-up can be on the face
-#: or on the legs, and that choice belongs here, not in `framing` itself.
+#: camera_angle (vertical shooting angle: level/low/high/bird's-eye/
+#: worm's-eye) and camera_height (where the camera physically sits on
+#: <Subject 1>'s body) were tried alongside this and dropped: across a
+#: night of testing, H3 followed them well under maybe a third of the
+#: time at best (camera_height close to never), and "bird's eye view"
+#: occasionally rendered <Subject 1> upside-down instead of shooting from
+#: above. camera_target alone was reliable, so it's the one that stayed.
 _CAMERA_TARGET_PHRASES = {
     "whole body": "<Subject 1>",
     "lower legs": "<Subject 1>'s lower legs",
@@ -1532,17 +1487,15 @@ _MAX_CUSTOM_SHOTS = 15
 
 
 class H3LookSheetsShotConfig:
-    """One shot's angle, framing, camera angle/height/target and expression,
-    packed into one string.
+    """One shot's angle, framing, camera target and expression, packed into
+    one string.
 
-    `camera_angle` and `camera_height` describe the camera's own position
-    (tilted up/down, how high off the ground); `camera_target` says what
-    body part it's actually pointed at — needed to keep the two coherent
-    (e.g. a bird's-eye view only reads as one when it's aimed at something
-    below the camera, like the chest, not the eyes it's already level with).
+    `camera_target` says what body part the camera is actually pointed at,
+    independent of `framing`'s zoom level - a close-up can be on the face
+    or on the legs.
 
     Feeds a single `shot_N` socket on H3LookSheetsCustomPrompt — see the
-    module note above for why this exists instead of six plain combos.
+    module note above for why this exists instead of four plain combos.
     """
 
     @classmethod
@@ -1551,8 +1504,6 @@ class H3LookSheetsShotConfig:
             "required": {
                 "angle": (_ANGLE_OPTIONS,),
                 "framing": (_FRAMING_OPTIONS,),
-                "camera_angle": (_CAMERA_ANGLE_OPTIONS,),
-                "camera_height": (_CAMERA_HEIGHT_OPTIONS,),
                 "camera_target": (_CAMERA_TARGET_OPTIONS,),
                 "expression": (_EXPRESSION_OPTIONS,),
             },
@@ -1563,9 +1514,9 @@ class H3LookSheetsShotConfig:
     FUNCTION = "build"
     CATEGORY = "H3LookSheets"
 
-    def build(self, angle, framing, camera_angle, camera_height, camera_target, expression):
+    def build(self, angle, framing, camera_target, expression):
         return (_SHOT_CONFIG_SEP.join(
-            (angle, framing, camera_angle, camera_height, camera_target, expression)
+            (angle, framing, camera_target, expression)
         ),)
 
 
@@ -1646,12 +1597,12 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{text} from {tag}" for text, tag in zip(outfit_items, outfit_tags)
         )
 
-        parsed: list[tuple[str, str, str, str, str, str]] = []
+        parsed: list[tuple[str, str, str, str]] = []
         for value in (shots or {}).values():
             if not value:
                 continue
             parts = value.split(_SHOT_CONFIG_SEP)
-            if len(parts) != 6:
+            if len(parts) != 4:
                 continue
             parsed.append(tuple(parts))
 
@@ -1712,9 +1663,7 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         # camera move vs. instant cut) read as conflicting motion signals
         # and showed up as residual drift/sway instead of a clean stop
         # between shots, so the intro now describes instant cuts to a new,
-        # fixed camera position, never movement. Height/tilt wording is
-        # spelled out here too since a shot can set camera_angle/
-        # camera_height — without it H3 defaults back to eye level.
+        # fixed camera position, never movement.
         # The within-shot stillness clause is separate from the hard-cut
         # wording above: that one stops the camera from drifting *between*
         # shots, this one stops it from creeping up/down *within* a single
@@ -1749,25 +1698,18 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         )
 
         shot_lines = []
-        for i, (angle, framing, camera_angle, camera_height, camera_target, expression) in enumerate(parsed):
+        for i, (angle, framing, camera_target, expression) in enumerate(parsed):
             framing_text = _FRAMING_PHRASES.get(framing, framing)
             angle_text = _ANGLE_PHRASES.get(angle, angle)
             target_text = _CAMERA_TARGET_PHRASES.get(camera_target, camera_target)
-            angle_template = _CAMERA_ANGLE_TEMPLATES.get(camera_angle)
-            camera_angle_text = (
-                angle_template.format(target=target_text) if angle_template is not None else camera_angle
-            )
             expr_text = _EXPRESSION_PHRASES.get(expression, expression)
             if i == 0:
                 opener = "[Shot 1] "
             else:
                 opener = f"[Shot {i + 1}] At {at[i]}, a hard cut to "
-            camera_text = camera_angle_text
-            if camera_angle not in _CAMERA_ANGLE_FIXED_HEIGHT:
-                camera_text += f", {_CAMERA_HEIGHT_PHRASES.get(camera_height, camera_height)}"
             shot_lines.append(
                 f"{opener}{framing_text} of {target_text}, wearing the outfit "
-                f"from {outfit_ref}, {angle_text}, {camera_text}, a static, "
+                f"from {outfit_ref}, {angle_text}, a static, "
                 f"locked-off shot, with a {expr_text} expression."
             )
         detail = "detailed_description:\n" + intro + "\n" + "\n".join(shot_lines)
