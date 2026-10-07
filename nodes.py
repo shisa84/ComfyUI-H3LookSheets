@@ -1395,46 +1395,111 @@ class H3LookSheetsDatasheetSettings:
 # --------------------------------------------------------------------------
 # H3LookSheetsShotConfig / H3LookSheetsCustomPrompt
 #
-# Any number of shots (up to 15), each with its own angle, framing, camera
-# target and expression, instead of a hardcoded per-shot template.
+# Any number of shots (up to 15), each with its own shot description and
+# expression, instead of a hardcoded per-shot template.
 #
 # Autogrow (the "plug one, the next slot appears" mechanism) only works on
-# socket inputs, and forces every widget it wraps into one too — four
-# Autogrow'd combos per shot would mean 4x sockets and no ready-made node to
+# socket inputs, and forces every widget it wraps into one too — two
+# Autogrow'd combos per shot would mean 2x sockets and no ready-made node to
 # feed a bare combo value into a socket. H3LookSheetsShotConfig sidesteps
-# that: its own angle/framing/camera target/expression combos stay ordinary
-# inline widgets (it isn't itself using Autogrow), and it packs all four
-# into one string — so H3LookSheetsCustomPrompt only needs ONE Autogrow
-# socket per shot, fed by one of these nodes, not four.
+# that: its own shot_description/expression combos stay ordinary inline
+# widgets (it isn't itself using Autogrow), and it packs both into one
+# string — so H3LookSheetsCustomPrompt only needs ONE Autogrow socket per
+# shot, fed by one of these nodes, not two.
 # --------------------------------------------------------------------------
 
-_ANGLE_PHRASES = {
-    "front": "facing the camera directly",
-    "front 3/4 left": "turned three-quarters toward camera-left, most of the face and body visible",
-    "front 3/4 right": "turned three-quarters toward camera-right, most of the face and body visible",
-    "left profile": "turned to show the left profile",
-    "right profile": "turned to show the right profile",
-    "back 3/4 left": "turned mostly away, seen three-quarters from the back on the left side",
-    "back 3/4 right": "turned mostly away, seen three-quarters from the back on the right side",
-    "back": "facing away from the camera, back to camera — a rear view",
+#: EXPERIMENTAL, uncommitted - replaces angle/framing/camera_target with
+#: one combo. A night of testing (camera_position_tests/report.txt)
+#: showed that composing independent phrase fragments (angle + framing +
+#: camera_target, same as the earlier camera_angle/camera_height/
+#: camera_target attempt) doesn't compose reliably - e.g. angle="back" +
+#: framing="medium shot" silently reverts to a front-facing shot for most
+#: camera_target values, while the exact opposite framing values are the
+#: ones that fail for camera_target="chest". Photography jargon like
+#: "medium shot" seems to be part of the problem, so this describes each
+#: shot as one literal, physical crop boundary instead (e.g. "framed from
+#: waist to knee") with no abstract framing/angle terms to recombine.
+#:
+#: Every combination of orientation x body region is listed below
+#: rather than hand-picked, including ones that may not make sense
+#: (e.g. "Head - Back") - keep all of them until the next round of
+#: testing shows which to drop or reword. One flat dict, one value per
+#: option - no templating/generation step to re-derive a value from.
+_SHOT_DESCRIPTION_PHRASES = {
+    "Full Body - Front": "a full-body shot, front view, facing the camera, from head to toe",
+    "Full Body - Front 3/4 Left": "a full-body shot, turned three-quarters to the left, from head to toe",
+    "Full Body - Front 3/4 Right": "a full-body shot, turned three-quarters to the right, from head to toe",
+    "Full Body - Left Profile": "a full-body shot, left profile, from head to toe",
+    "Full Body - Right Profile": "a full-body shot, right profile, from head to toe",
+    "Full Body - Back 3/4 Left": "a full-body shot, mostly turned away, seen three-quarters from the back on the left side, from head to toe",
+    "Full Body - Back 3/4 Right": "a full-body shot, mostly turned away, seen three-quarters from the back on the right side, from head to toe",
+    "Full Body - Back": "a full-body shot, back view, from head to toe",
+    "Upper Body - Front": "front view, facing the camera, framed from waist to top of head",
+    "Upper Body - Front 3/4 Left": "turned three-quarters to the left, framed from waist to top of head",
+    "Upper Body - Front 3/4 Right": "turned three-quarters to the right, framed from waist to top of head",
+    "Upper Body - Left Profile": "left profile, framed from waist to top of head",
+    "Upper Body - Right Profile": "right profile, framed from waist to top of head",
+    "Upper Body - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, framed from waist to top of head",
+    "Upper Body - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, framed from waist to top of head",
+    "Upper Body - Back": "back view, framed from waist to top of head",
+    "Lower Body - Front": "front view, facing the camera, framed between the stomach and the feet",
+    "Lower Body - Front 3/4 Left": "turned three-quarters to the left, framed between the stomach and the feet",
+    "Lower Body - Front 3/4 Right": "turned three-quarters to the right, framed between the stomach and the feet",
+    "Lower Body - Left Profile": "left profile, framed between the stomach and the feet",
+    "Lower Body - Right Profile": "right profile, framed between the stomach and the feet",
+    "Lower Body - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, framed from the lower back to the feet",
+    "Lower Body - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, framed from the lower back to the feet",
+    "Lower Body - Back": "back view, framed from the lower back to the feet",
+    "Upper Legs - Front": "front view, facing the camera, framed from waist to knee",
+    "Upper Legs - Front 3/4 Left": "turned three-quarters to the left, framed from waist to knee",
+    "Upper Legs - Front 3/4 Right": "turned three-quarters to the right, framed from waist to knee",
+    "Upper Legs - Left Profile": "left profile, framed from waist to knee",
+    "Upper Legs - Right Profile": "right profile, framed from waist to knee",
+    "Upper Legs - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, framed from waist to knee",
+    "Upper Legs - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, framed from waist to knee",
+    "Upper Legs - Back": "back view, framed from waist to knee",
+    "Lower Legs - Front": "front view, facing the camera, framed from knee to feet",
+    "Lower Legs - Front 3/4 Left": "turned three-quarters to the left, framed from knee to feet",
+    "Lower Legs - Front 3/4 Right": "turned three-quarters to the right, framed from knee to feet",
+    "Lower Legs - Left Profile": "left profile, framed from knee to feet",
+    "Lower Legs - Right Profile": "right profile, framed from knee to feet",
+    "Lower Legs - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, framed from knee to feet",
+    "Lower Legs - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, framed from knee to feet",
+    "Lower Legs - Back": "back view, framed from knee to feet",
+    "Waist - Front": "front view, facing the camera, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Front 3/4 Left": "turned three-quarters to the left, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Front 3/4 Right": "turned three-quarters to the right, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Left Profile": "left profile, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Right Profile": "right profile, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Back": "back view, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Chest - Front": "front view, facing the camera, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Front 3/4 Left": "turned three-quarters to the left, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Front 3/4 Right": "turned three-quarters to the right, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Left Profile": "left profile, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Right Profile": "right profile, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Back": "back view, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Head - Front": "front view, facing the camera, close framing on the head",
+    "Head - Front 3/4 Left": "turned three-quarters to the left, close framing on the head",
+    "Head - Front 3/4 Right": "turned three-quarters to the right, close framing on the head",
+    "Head - Left Profile": "left profile, close framing on the head",
+    "Head - Right Profile": "right profile, close framing on the head",
+    "Head - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, close framing on the head",
+    "Head - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, close framing on the head",
+    "Head - Back": "back view, close framing on the head",
 }
-_ANGLE_OPTIONS = list(_ANGLE_PHRASES.keys())
+_SHOT_DESCRIPTION_OPTIONS = list(_SHOT_DESCRIPTION_PHRASES.keys())
 
-#: Pure zoom level/field of view — how tight the shot is, independent of
-#: which body part it's actually on. That's `camera_target`'s job (below):
-#: "close-up" alone doesn't say close-up on what, and used to hardcode
-#: "shoulders/face" into the name, which fought `camera_target` whenever
-#: it pointed anywhere else (e.g. a close-up aimed at the legs).
-_FRAMING_PHRASES = {
-    "extreme wide shot": "an extreme wide shot",
-    "wide shot": "a wide shot",
-    "medium wide shot": "a medium-wide shot",
-    "medium shot": "a medium shot",
-    "medium close-up": "a medium close-up",
-    "close-up": "a close-up",
-    "extreme close-up": "an extreme close-up",
-}
-_FRAMING_OPTIONS = list(_FRAMING_PHRASES.keys())
+#: `expression` only gets mentioned in the prompt when the face is
+#: actually in frame: the region has to include the head at all (Chest/
+#: Waist/Lower Body/Upper Legs/Lower Legs never do), and the orientation
+#: has to face the camera (profile/back views don't show the face even
+#: when the region would otherwise include it).
+_FACE_VISIBLE_REGIONS = {"Full Body", "Upper Body", "Head"}
+_FACE_VISIBLE_ORIENTATIONS = {"Front", "Front 3/4 Left", "Front 3/4 Right"}
 
 _EXPRESSION_PHRASES = {
     "neutral": "neutral",
@@ -1455,29 +1520,6 @@ _EXPRESSION_PHRASES = {
 }
 _EXPRESSION_OPTIONS = list(_EXPRESSION_PHRASES.keys())
 
-#: What the camera is actually pointed at — also what `framing`'s zoom
-#: level is actually zoomed in on (see note above _FRAMING_PHRASES) — a
-#: close-up can be on the face or on the legs, and that choice belongs
-#: here, not in `framing` itself.
-#:
-#: camera_angle (vertical shooting angle: level/low/high/bird's-eye/
-#: worm's-eye) and camera_height (where the camera physically sits on
-#: <Subject 1>'s body) were tried alongside this and dropped: across a
-#: night of testing, H3 followed them well under maybe a third of the
-#: time at best (camera_height close to never), and "bird's eye view"
-#: occasionally rendered <Subject 1> upside-down instead of shooting from
-#: above. camera_target alone was reliable, so it's the one that stayed.
-_CAMERA_TARGET_PHRASES = {
-    "whole body": "<Subject 1>",
-    "lower legs": "<Subject 1>'s lower legs",
-    "upper legs": "<Subject 1>'s upper legs",
-    "waist": "<Subject 1>'s waist",
-    "chest": "<Subject 1>'s chest",
-    "face": "<Subject 1>'s face",
-    "eyes": "<Subject 1>'s eyes",
-}
-_CAMERA_TARGET_OPTIONS = list(_CAMERA_TARGET_PHRASES.keys())
-
 #: Separator packed between the combo values — chosen because none of the
 #: option strings above contain it, so splitting is unambiguous.
 _SHOT_CONFIG_SEP = "||"
@@ -1487,24 +1529,22 @@ _MAX_CUSTOM_SHOTS = 15
 
 
 class H3LookSheetsShotConfig:
-    """One shot's angle, framing, camera target and expression, packed into
-    one string.
+    """One shot's description and expression, packed into one string.
 
-    `camera_target` says what body part the camera is actually pointed at,
-    independent of `framing`'s zoom level - a close-up can be on the face
-    or on the legs.
+    `shot_description` is a single combo covering body region and camera
+    orientation together (e.g. "Lower Legs - Back"), instead of composing
+    them from separate angle/framing/camera_target combos - see the note
+    above _SHOT_DESCRIPTION_PHRASES for why.
 
     Feeds a single `shot_N` socket on H3LookSheetsCustomPrompt — see the
-    module note above for why this exists instead of four plain combos.
+    module note above for why this exists instead of two plain combos.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "angle": (_ANGLE_OPTIONS,),
-                "framing": (_FRAMING_OPTIONS,),
-                "camera_target": (_CAMERA_TARGET_OPTIONS,),
+                "shot_description": (_SHOT_DESCRIPTION_OPTIONS,),
                 "expression": (_EXPRESSION_OPTIONS,),
             },
         }
@@ -1514,9 +1554,9 @@ class H3LookSheetsShotConfig:
     FUNCTION = "build"
     CATEGORY = "H3LookSheets"
 
-    def build(self, angle, framing, camera_target, expression):
+    def build(self, shot_description, expression):
         return (_SHOT_CONFIG_SEP.join(
-            (angle, framing, camera_target, expression)
+            (shot_description, expression)
         ),)
 
 
@@ -1597,12 +1637,12 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{text} from {tag}" for text, tag in zip(outfit_items, outfit_tags)
         )
 
-        parsed: list[tuple[str, str, str, str]] = []
+        parsed: list[tuple[str, str]] = []
         for value in (shots or {}).values():
             if not value:
                 continue
             parts = value.split(_SHOT_CONFIG_SEP)
-            if len(parts) != 4:
+            if len(parts) != 2:
                 continue
             parsed.append(tuple(parts))
 
@@ -1631,9 +1671,8 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{total_shots} static shots, retaining only {p['poss']} hair, "
             f"body shape, skin, and facial structure from {person_ref}, while "
             f"preserving the outfit from {outfit_ref}. The background remains "
-            f"{set_dressing}. Framing, angle and expression change shot to "
-            "shot as described below; pose is otherwise held still within "
-            "each shot."
+            f"{set_dressing}. Framing changes shot to shot as "
+            "described below; pose is otherwise held still within each shot."
         )
 
         outfit_retention = "\n".join(
@@ -1674,10 +1713,8 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         # "locked-off") reads as still without naming any motion at all.
         intro = (
             f"The target video uses a static studio lighting setup against "
-            f"{set_dressing}. All shots are framed with generous empty "
-            "margins on every side, ensuring the entire figure and any "
-            "extensions remain fully within the frame without touching or "
-            f"crossing edges. {set_dressing[0].upper()}{set_dressing[1:]} "
+            f"{set_dressing}. "
+            f"{set_dressing[0].upper()}{set_dressing[1:]} "
             "and its bright, even lighting stay completely identical across "
             f"all {shots_word} shots. No text, watermark, logo, caption, or "
             "writing of any kind appears anywhere in the video. "
@@ -1687,8 +1724,7 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"removed. <Subject 1>'s hair, hairstyle, and haircut come from "
             f"{person_ref} and stay identical across all {shots_word} shots. "
             "Each shot is an instant hard cut to a new camera position and "
-            "angle around <Subject 1> — closer or farther, higher or "
-            "lower, tilted up or down. Within each shot, the camera is a "
+            "angle relative to <Subject 1>. Within each shot, the camera is a "
             "single static, locked-off shot, as if mounted on a tripod: "
             "completely still from the first frame of the shot to the "
             "last, right up to the next hard cut. <Subject 1> remains "
@@ -1698,20 +1734,26 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         )
 
         shot_lines = []
-        for i, (angle, framing, camera_target, expression) in enumerate(parsed):
-            framing_text = _FRAMING_PHRASES.get(framing, framing)
-            angle_text = _ANGLE_PHRASES.get(angle, angle)
-            target_text = _CAMERA_TARGET_PHRASES.get(camera_target, camera_target)
-            expr_text = _EXPRESSION_PHRASES.get(expression, expression)
+        for i, (shot_description, expression) in enumerate(parsed):
+            shot_text = _SHOT_DESCRIPTION_PHRASES.get(shot_description, shot_description)
+            region, _, orientation = shot_description.rpartition(" - ")
             if i == 0:
                 opener = "[Shot 1] "
             else:
                 opener = f"[Shot {i + 1}] At {at[i]}, a hard cut to "
-            shot_lines.append(
-                f"{opener}{framing_text} of {target_text}, wearing the outfit "
-                f"from {outfit_ref}, {angle_text}, a static, "
-                f"locked-off shot, with a {expr_text} expression."
+            line = (
+                f"{opener}{shot_text}, wearing the outfit from {outfit_ref}, "
+                f"a static, locked-off shot"
             )
+            if i == len(parsed) - 1:
+                # The "right up to the next hard cut" clause in the intro has
+                # nothing to refer to for the last shot - state explicitly
+                # that stillness holds through to the end instead.
+                line += ", held until the end of the video"
+            if region in _FACE_VISIBLE_REGIONS and orientation in _FACE_VISIBLE_ORIENTATIONS:
+                expr_text = _EXPRESSION_PHRASES.get(expression, expression)
+                line += f", with a {expr_text} expression"
+            shot_lines.append(line + ".")
         detail = "detailed_description:\n" + intro + "\n" + "\n".join(shot_lines)
 
         prompt = (

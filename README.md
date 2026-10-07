@@ -99,7 +99,7 @@ LoadImage (outfit) ×N ─► Describe Reference (target=outfit) ─► descript
 | Node | Category | What it does |
 |---|---|---|
 | **Look Sheet Prompt - Custom Shots (H3)** | `H3LookSheets` | Writes the ref2va prompt from a freely chosen list of 1–15 shots (`H3LookSheetsCustomPrompt`) |
-| **Shot Config (H3 Look Sheet)** | `H3LookSheets` | One shot's angle/framing/camera target/expression, packed for the node above (`H3LookSheetsShotConfig`) |
+| **Shot Config (H3 Look Sheet)** | `H3LookSheets` | One shot's description/expression, packed for the node above (`H3LookSheetsShotConfig`) |
 | **Describe Reference (H3 Look Sheet)** | `H3LookSheets` | One-sentence vision description per reference photo (up to 8), with retry and fallback prompts (`H3LookSheetsDescribe`) |
 | **Image Aggregator (H3 Look Sheet)** | `H3LookSheets` | Routes the person and outfit images into `MiniMaxH3ReferenceToVideo`'s 9 `ref_image` slots (`H3ImageAggregator`) |
 | **Prompt View (H3 Look Sheet)** | `H3LookSheets` | Colorized read-only preview of a prompt, with a copy button and an edit-a-copy override (`H3LookSheetsPromptView`) |
@@ -139,19 +139,24 @@ outfit shown" so the numbering never shifts.
 
 ### Shot Config (H3 Look Sheet)
 
-Four inline dropdowns, packed into one string for the node above.
+**Experimental** — two inline dropdowns, packed into one string for the
+node above.
 
 | Combo | Options |
 |---|---|
-| `angle` | front, front 3/4 left, front 3/4 right, left profile, right profile, back 3/4 left, back 3/4 right, back |
-| `framing` | extreme wide shot, wide shot, medium wide shot, medium shot, medium close-up, close-up, extreme close-up |
-| `camera_target` | whole body, lower legs, upper legs, waist, chest, face, eyes |
+| `shot_description` | one combo covering body region and camera orientation together, e.g. `Lower Legs - Back` (8 regions × 8 orientations = 64 options) |
 | `expression` | neutral, happy, smiling, sad, angry, surprised, scared, disgusted, shy/embarrassed, confident, serious, laughing, crying, smirking, confused |
 
-`camera_target` is what `framing`'s zoom level is actually zoomed in on —
-a `close-up` can be on the face or on the legs, pick both together with
-the subject visible. E.g. `back` + `close-up` + `camera_target: face`
-shows no face for the expression to read on.
+`expression` only shows up in the prompt when the region includes the
+head (`Full Body`, `Upper Body`, `Head`) and the orientation faces the
+camera (`Front`, `Front 3/4 Left`, `Front 3/4 Right`) — elsewhere the
+face isn't in frame, so stating an expression would ask for something
+that can't be read.
+
+This replaces the previous `angle` + `framing` + `camera_target`
+combos: composing them independently didn't hold up well across
+testing (see `camera_position_tests/report.txt`), so each shot is now
+described as one literal, physical framing instead.
 
 ---
 
