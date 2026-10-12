@@ -39,16 +39,6 @@ except ImportError:
 
 #: Only two manual choices — each reference photo holds exactly one person,
 #: never an ambiguous group, so there's no case a they/them override serves.
-#: English word for small shot counts (5 or 6 in practice) — reads naturally
-#: in the intro sentence ("across all six shots") instead of a bare digit.
-_COUNT_WORDS = {
-    1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
-    8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
-    13: "thirteen", 14: "fourteen", 15: "fifteen",
-}
-
-#: Only two manual choices — each reference photo holds exactly one person,
-#: never an ambiguous group, so there's no case a they/them override serves.
 _PRONOUNS = {
     "female": {"subj": "she", "poss": "her"},
     "male": {"subj": "he", "poss": "his"},
@@ -1764,7 +1754,6 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         step = max(0.1, math.floor((duration / total_shots) * 10) / 10)
         at = [_timecode(i * step) for i in range(total_shots)]
         shot_tags = ", ".join(f"[Shot {i + 1}]" for i in range(total_shots))
-        shots_word = _COUNT_WORDS.get(total_shots, str(total_shots))
 
         header = (
             f"subject_definitions:\n<Subject 1> {person}, and the same figure "
@@ -1804,7 +1793,7 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{outfit_retention}"
         )
 
-        # The explicit "hair stays at rest" clause is load-bearing: without
+        # The explicit "hair rests still" clause is load-bearing: without
         # it H3 tends to render windswept/flying hair between cuts, as if
         # carrying motion over from a turn that never actually happened.
         # The intro used to describe the camera "repositioning... to capture
@@ -1822,26 +1811,36 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         # better, likely because naming the motions (even negated) cues H3
         # toward them. Positive, static-only wording ("tripod-mounted",
         # "locked-off") reads as still without naming any motion at all.
+        # Watch "torso, shoulders and hips stay facing the camera": every cut
+        # moves the camera, so on a Back or Side shot it may pull the body
+        # round to face the lens instead of showing the back or profile. If
+        # it does, "facing that same direction" keeps the pose fixed without
+        # tying it to the camera.
         intro = (
             f"The target video uses a static studio lighting setup against "
             f"{set_dressing}. "
             f"{set_dressing[0].upper()}{set_dressing[1:]} "
             "and its bright, even lighting stay completely identical across "
-            f"all {shots_word} shots. No text, watermark, logo, caption, or "
+            "every shot. No text, watermark, logo, caption, or "
             "writing of any kind appears anywhere in the video. "
             f"<Subject 1> wears the outfit and accessories from {outfit_ref} "
-            f"continuously from the very first frame through all {shots_word} "
-            "shots, without any garment changing, shifting, or being "
+            "continuously from the very first frame through every shot, "
+            "without any garment changing, shifting, or being "
             f"removed. <Subject 1>'s hair, hairstyle, and haircut come from "
-            f"{person_ref} and stay identical across all {shots_word} shots. "
-            "Each shot is an instant hard cut to a new camera position and "
-            "angle relative to <Subject 1>. Within each shot, the camera is a "
-            "single static, locked-off shot, as if mounted on a tripod: "
-            "completely still from the first frame of the shot to the "
-            "last, right up to the next hard cut. <Subject 1> remains "
-            "completely motionless throughout, holding one exact pose "
-            "without turning, walking, gesturing, or otherwise moving "
-            "between cuts, and hair stays at rest in that pose between cuts."
+            f"{person_ref} and stay identical across every shot. "
+            "<Subject 1> stands perfectly still like a statue, upright, "
+            "weight evenly on both feet, feet together, arms hanging relaxed "
+            f"at {p['poss']} sides, chin level, {p['poss']} shoulders square "
+            f"and aligned with {p['poss']} hips, {p['poss']} whole body facing "
+            "one fixed direction, frozen in this exact pose for the entire "
+            f"video; {p['poss']} hair rests still within each shot. The only "
+            "motion in the video is slow, subtle breathing and an occasional "
+            f"blink; {p['poss']} torso, shoulders and hips stay facing the "
+            "camera. Each shot is an instant hard cut to a new camera "
+            "position and angle relative to <Subject 1>. Within each shot, "
+            "the camera is a single static, locked-off shot, as if mounted "
+            "on a tripod: completely still from the first frame of the shot "
+            "to the last, right up to the next hard cut."
         )
 
         shot_lines = []
