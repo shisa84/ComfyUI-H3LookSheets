@@ -1307,7 +1307,7 @@ class H3LookSheetsSelectFrames:
                 "selection_scope": (["whole_video", "per_shot"], {"default": "whole_video",
                     "tooltip": "whole_video: the tier 1-3 cascade runs once over the whole take, with the video_* settings. per_shot: it runs inside each shot, with the shot_* settings."}),
                 "shot_count": ("INT", {"default": 6, "min": 1, "max": _MAX_CUSTOM_SHOTS,
-                    "tooltip": "per_shot only: number of shots in the take. The take is cut at its shot_count - 1 hardest scene changes."}),
+                    "tooltip": "per_shot only: number of shots in the take — wire it from Look Sheet Prompt - Custom Shots' shot_count output. The take is cut at its shot_count - 1 hardest scene changes."}),
                 "tier2_clip": ("CLIP", {"tooltip": "In-graph vision-language CLIP for tier 2, shared by both scopes. Leave unplugged to skip straight to tier 3 for any leftover slots."}),
                 "tier2_prompt_subject_description": ("STRING", {"default": "the subject", "multiline": True,
                     "tooltip": "What the frames should document, shown to the tier 2 vision model. Shared by both scopes."}),
@@ -1709,7 +1709,12 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
                     ),
                 ),
             ],
-            outputs=[io.String.Output(display_name="prompt")],
+            # shot_count is appended after prompt so links saved on output 0 stay put.
+            outputs=[
+                io.String.Output(display_name="prompt"),
+                io.Int.Output(display_name="shot_count",
+                    tooltip="How many shots the prompt describes — feed it to Select Frames' shot_count."),
+            ],
         )
 
     @classmethod
@@ -1866,7 +1871,7 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{header}\n\n{summary}\n\n{retention}\n\n{detail}\n\n"
             "overall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A"
         )
-        return io.NodeOutput(prompt)
+        return io.NodeOutput(prompt, total_shots)
 
 
 #: Rendered by web/h3looksheets_prompt_view.js; the value is JSON:

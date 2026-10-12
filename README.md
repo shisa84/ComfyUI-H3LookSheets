@@ -137,6 +137,11 @@ outfit shown" so the numbering never shifts.
 | `video_duration_seconds` | FLOAT | The take's real length — feed it from whatever sets `length` on `MiniMaxH3ReferenceToVideo`, divided by however many shots are connected |
 | `shot_0` … `shot_14` | STRING (Autogrow) | Each fed by a **Shot Config** node |
 
+| Output | Type | Notes |
+|---|---|---|
+| `prompt` | STRING | The finished ref2va prompt |
+| `shot_count` | INT | How many shots the prompt describes. Wire it into **Select Frames**' `shot_count` so `per_shot` always cuts the take into the right number of shots |
+
 ### Shot Config (H3 Look Sheet)
 
 **Experimental** — two inline dropdowns, packed into one string for the
@@ -279,7 +284,7 @@ own copy of every setting:
 |---|---|---|
 | `images` | — | The rendered take (decoded frames) |
 | `selection_scope` | — | `whole_video` or `per_shot`, see above |
-| `shot_count` | per_shot | Number of shots in the take |
+| `shot_count` | per_shot | Number of shots in the take — wire it from **Look Sheet Prompt - Custom Shots**' `shot_count` output |
 | `tier2_clip` | 2 | In-graph vision CLIP, shared by both scopes. Leave unplugged to skip straight to tier 3 |
 | `<scope>_saved_frame_count` | — | Frames returned: for the whole take, or for each shot |
 | `<scope>_tier1_shots_clusters` | 1 | Distinct views to guarantee. Set equal to `<scope>_saved_frame_count` for a fully deterministic run — tiers 2/3 never trigger |
