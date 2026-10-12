@@ -251,10 +251,10 @@ this node can.
 
 ### Select Frames (H3 Look Sheet)
 
-Picks `saved_frame_count` reference frames out of the rendered take, via a
-fixed three-tier cascade:
+Picks reference frames out of the rendered take, via a fixed three-tier
+cascade, run either once over the whole take or once inside each shot:
 
-1. **Tier 1 — cluster by content.** Groups the leftover frames into
+1. **Tier 1 — cluster by content.** Groups the frames into
    `tier1_shots_clusters` visually distinct clusters, takes the sharpest
    frame of each. Deterministic, always runs.
 2. **Tier 2 — vision-informed diversity fill.** If slots remain
@@ -265,20 +265,39 @@ fixed three-tier cascade:
    but does not decide which frames are kept.
 3. **Tier 3 — sharpness + diversity fallback.** Fills whatever tier 2
    didn't, the same diversity-first way, so the node always returns exactly
-   `saved_frame_count` frames (or every frame, if the video has fewer).
+   `saved_frame_count` frames (or every frame, if there are fewer).
+
+`selection_scope` picks what the cascade runs over, and each scope has its
+own copy of every setting:
+
+| `selection_scope` | Runs over | Settings read | Frames returned |
+|---|---|---|---|
+| `whole_video` (default) | the whole take, once | `video_*` | `video_saved_frame_count` |
+| `per_shot` | each shot, separately | `shot_count` and `shot_*` | `shot_count × shot_saved_frame_count` |
 
 | Input | Tier | Notes |
 |---|---|---|
 | `images` | — | The rendered take (decoded frames) |
-| `saved_frame_count` | — | Total frames returned |
-| `tier1_shots_clusters` | 1 | Distinct views to guarantee. Set equal to `saved_frame_count` for a fully deterministic run — tiers 2/3 never trigger |
-| `tier2_clip` | 2 | In-graph vision CLIP. Leave unplugged to skip straight to tier 3 |
-| `tier2_candidates` | 2 | Clusters formed from the leftover pool for the shortlist |
-| `tier2_prompt_subject_description` / `tier2_prompt_how_to_select_frames` | 2 | Text shown to the vision model, logged in `debug` |
-| `tier2_free_vram_first` | 2 | Unload other resident models before the tier-2 vision call |
-| `tier2_max_token_length` / `tier2_temperature` / `tier2_thinking` | 2 | Passed to the vision call |
-| `tier3_sharpness_diversity` | 3 | Off returns fewer than `saved_frame_count` instead of filling |
-| `tier3_sharpness_weight` | 3 | Balance between sharpness and diversity when filling |
+| `selection_scope` | — | `whole_video` or `per_shot`, see above |
+| `shot_count` | per_shot | Number of shots in the take |
+| `tier2_clip` | 2 | In-graph vision CLIP, shared by both scopes. Leave unplugged to skip straight to tier 3 |
+| `<scope>_saved_frame_count` | — | Frames returned: for the whole take, or for each shot |
+| `<scope>_tier1_shots_clusters` | 1 | Distinct views to guarantee. Set equal to `<scope>_saved_frame_count` for a fully deterministic run — tiers 2/3 never trigger |
+| `<scope>_tier2_candidates` | 2 | Clusters formed from the leftover pool for the shortlist |
+| `tier2_prompt_subject_description` | 2 | What the frames should document, shown to the vision model. Shared by both scopes |
+| `<scope>_tier2_prompt_how_to_select_frames` | 2 | Selection criteria shown to the vision model |
+| `<scope>_tier2_free_vram_first` | 2 | Unload other resident models before the tier-2 vision call |
+| `<scope>_tier2_max_token_length` / `<scope>_tier2_temperature` / `<scope>_tier2_thinking` | 2 | Passed to the vision call |
+| `<scope>_tier3_sharpness_diversity` | 3 | Off returns fewer than `<scope>_saved_frame_count` instead of filling |
+| `<scope>_tier3_sharpness_weight` | 3 | Balance between sharpness and diversity when filling |
+
+`<scope>` is `video` or `shot`. The `shot_*` set defaults to 2 frames and 2
+clusters per shot, the `video_*` set to 6 and 6.
+
+The node only shows the inputs the current scope reads: the set of the other
+scope is hidden and `shot_count` only shows for `per_shot`. `tier2_clip` and
+`tier2_prompt_subject_description` always show, since both scopes use them.
+An input that has a link plugged into it always stays visible.
 
 `debug` (STRING output) lists, per returned frame, which tier picked it:
 
@@ -289,6 +308,32 @@ fixed three-tier cascade:
   frame 71: Tier 2: vision (clip, diversity-picked)
 tier 2 shortlist shown to model (16): [...]
 tier 2 raw reply (json_ok=True, 153 chars): {"picks": [1, 2, ...], "why": "..."}
+```
+
+#### `per_shot` scope
+
+The take is cut into `shot_count` shots at its hardest scene changes, then
+the cascade runs inside each shot on its own frames, so every shot gets its
+own `shot_saved_frame_count` frames and nothing competes across shots. The
+result is in video order.
+
+`shot_count` must match the real number of shots: too low merges two shots,
+too high splits one. A shot shorter than `shot_saved_frame_count` returns all
+its frames.
+
+With `tier2_clip` wired and more slots than clusters, tier 2 makes one
+vision call per shot, not one per take.
+
+`debug` lists the frame range of each detected shot, what was kept from it,
+and that shot's own tier notes:
+
+```
+12/120 frames — 6 Tier 1: cluster (by content), 6 Tier 3: sharpness+diversity (fallback)
+  frame 3: Tier 1: cluster (by content)
+  ...
+shot 1: frames 0-19 -> [3, 14]
+  shot 1: tier 2 skipped: no clip connected
+shot 2: frames 20-44 -> [27, 39]
 ```
 
 ---

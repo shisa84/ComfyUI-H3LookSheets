@@ -37,6 +37,8 @@ try:
 except ImportError:
     model_prefetch = None
 
+#: Only two manual choices — each reference photo holds exactly one person,
+#: never an ambiguous group, so there's no case a they/them override serves.
 #: English word for small shot counts (5 or 6 in practice) — reads naturally
 #: in the intro sentence ("across all six shots") instead of a bare digit.
 _COUNT_WORDS = {
@@ -1010,6 +1012,39 @@ def _sf_cluster_pool(images: torch.Tensor, pool: list[int], k: int) -> list[list
     return [[pool[i] for i in g] for g in sub_groups]
 
 
+def _sf_split_into_shots(images: torch.Tensor, shots: int) -> list[list[int]]:
+    """Cut the take into `shots` contiguous runs at its hardest scene changes.
+
+    A cut is a big jump between two neighbouring frames' descriptors, so the
+    `shots - 1` biggest jumps are the boundaries. Splitting by time would be
+    wrong for the same reason `_sf_cluster_by_content` ignores time: H3 does
+    not hold the shot lengths the prompt asks for.
+
+    Cuts closer than `min_gap` frames count as one. The video VAE compresses
+    time, so one real cut can show up as two neighbouring jumps (frame -> blend
+    -> frame); without this a single cut would eat two of the `shots - 1`
+    slots and silently merge two real shots into one.
+    """
+    total = int(images.shape[0])
+    shots = max(1, min(shots, total))
+    if shots == 1:
+        return [list(range(total))]
+
+    desc = _sf_descriptors(images, 32)
+    jumps = (desc[1:] - desc[:-1]).norm(dim=1)  # jumps[i]: frame i -> frame i + 1
+    min_gap = max(1, min(4, total // shots))
+
+    cuts: list[int] = []
+    for i in torch.argsort(jumps, descending=True).tolist():
+        if all(abs(i - c) >= min_gap for c in cuts):
+            cuts.append(i)
+            if len(cuts) == shots - 1:
+                break
+
+    edges = [0, *sorted(c + 1 for c in cuts), total]
+    return [list(range(a, b)) for a, b in zip(edges, edges[1:])]
+
+
 def _sf_fill_by_diversity(images: torch.Tensor, pool: list[int], chosen: list[int],
                            want: int, sharpness_weight: float) -> list[int]:
     """Greedy farthest-point fill from `pool`: sharp, and far from `chosen`.
@@ -1184,8 +1219,42 @@ _SF_LEVEL_LABELS = {
     "cluster": "Tier 1: cluster (by content)",
     "vision": "Tier 2: vision (clip, diversity-picked)",
     "sharpness_diversity": "Tier 3: sharpness+diversity (fallback)",
-    "all": "kept (fewer frames in the video than requested)",
+    "all": "kept (fewer frames than requested)",
 }
+
+
+def _sf_cascade_inputs(prefix: str, saved: int, tier1: int, where: str) -> dict:
+    """The tier 1-3 widgets, named `<prefix>_<setting>` — one set per scope.
+
+    `video_*` drives the cascade over the whole take, `shot_*` drives it
+    inside each shot. The widget names minus the prefix are the keyword
+    arguments of `H3LookSheetsSelectFrames._cascade`. `tier2_clip` and
+    `tier2_prompt_subject_description` are not in here: they describe the
+    take, not how to pick from it, so both scopes share one of each (and the
+    subject is usually fed by a link, which would otherwise need wiring twice).
+    """
+    return {
+        f"{prefix}_saved_frame_count": ("INT", {"default": saved, "min": 1, "max": 32,
+            "tooltip": f"Total frames returned {where}. More than the tier 1 clusters leaves slots for vision/spread."}),
+        # --- tier 1: cluster by content ---
+        f"{prefix}_tier1_shots_clusters": ("INT", {"default": tier1, "min": 1, "max": 32,
+            "tooltip": f"Distinct views to guarantee {where} via clustering — tier 1."}),
+        # --- tier 2: vision judge (only if tier2_clip is wired) ---
+        f"{prefix}_tier2_candidates": ("INT", {"default": 16, "min": 4, "max": 32,
+            "tooltip": "Clusters formed from the leftover pool — also the shortlist size shown to the vision model. Each is represented by its sharpest frame, so this is both the diversity and the readability knob."}),
+        f"{prefix}_tier2_prompt_how_to_select_frames": ("STRING", {"default": _SF_DEFAULT_BRIEF, "multiline": True}),
+        f"{prefix}_tier2_free_vram_first": ("BOOLEAN", {"default": True,
+            "tooltip": "Unload other resident models before the tier-2 vision call."}),
+        f"{prefix}_tier2_max_token_length": ("INT", {"default": 400, "min": 64, "max": 4096}),
+        f"{prefix}_tier2_temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.05}),
+        f"{prefix}_tier2_thinking": ("BOOLEAN", {"default": False,
+            "tooltip": "Let the vision model reason before answering. The reasoning block is stripped before parsing picks either way."}),
+        # --- tier 3: sharpness + diversity fallback ---
+        f"{prefix}_tier3_sharpness_diversity": ("BOOLEAN", {"default": True,
+            "tooltip": "Fill leftover slots by sharpness+diversity when tier 2 doesn't cover them. Off returns fewer than the saved frame count instead."}),
+        f"{prefix}_tier3_sharpness_weight": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "Balance between sharpness and diversity when filling."}),
+    }
 
 
 class H3LookSheetsSelectFrames:
@@ -1211,36 +1280,39 @@ class H3LookSheetsSelectFrames:
     `debug` lists, for every returned frame, which of the three tiers chose
     it — so a run with `count == shots` reads "cluster" on every line, and
     you know at a glance whether `clip` ever got exercised at all.
+
+    `selection_scope` picks what the cascade runs over, with its own copy of
+    every setting: `video_*` runs it once over the whole take, `shot_*` cuts
+    the take into `shot_count` runs at its scene changes and runs it inside
+    each run, so every shot is represented equally instead of the whole
+    video competing for the slots. `shot_count` is its own input rather
+    than `video_tier1_shots_clusters`: that one is a clustering knob and is
+    routinely set to something other than the number of shots (e.g. 12
+    clusters over 6 shots).
     """
 
     @classmethod
     def INPUT_TYPES(cls):
+        # Dict order is the node's top-to-bottom widget order, and saved
+        # workflows store widget values by position — so a reorder or a new
+        # widget needs the migration in web/h3looksheets_select_frames.js.
+        # Everything but `images` is optional (with a default in `select`) so
+        # that API prompts exported before selection_scope existed still
+        # validate.
         return {
             "required": {
                 "images": ("IMAGE",),
-                "saved_frame_count": ("INT", {"default": 6, "min": 1, "max": 32,
-                    "tooltip": "Total frames returned. count > shots leaves slots for vision/spread."}),
-                # --- tier 1: cluster by content ---
-                "tier1_shots_clusters": ("INT", {"default": 6, "min": 1, "max": 32,
-                    "tooltip": "Distinct views to guarantee via clustering — tier 1."}),
             },
             "optional": {
-                # --- tier 2: vision judge (only if clip is wired) ---
-                "tier2_clip": ("CLIP", {"tooltip": "In-graph vision-language CLIP for tier 2. Leave unplugged to skip straight to tier 3 for any leftover slots."}),
-                "tier2_candidates": ("INT", {"default": 16, "min": 4, "max": 32,
-                    "tooltip": "Clusters formed from the leftover pool — also the shortlist size shown to the vision model. Each is represented by its sharpest frame, so this is both the diversity and the readability knob."}),
-                "tier2_prompt_subject_description": ("STRING", {"default": "the subject", "multiline": True}),
-                "tier2_prompt_how_to_select_frames": ("STRING", {"default": _SF_DEFAULT_BRIEF, "multiline": True}),
-                "tier2_free_vram_first": ("BOOLEAN", {"default": True,
-                    "tooltip": "Unload other resident models before the tier-2 vision call."}),
-                "tier2_max_token_length": ("INT", {"default": 400, "min": 64, "max": 4096}),
-                "tier2_temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "tier2_thinking": ("BOOLEAN", {"default": False,
-                    "tooltip": "Let the vision model reason before answering. The reasoning block is stripped before parsing picks either way."}),
-                # --- tier 3: sharpness + diversity fallback ---
-                "tier3_sharpness_diversity": ("BOOLEAN", {"default": True,
-                    "tooltip": "Fill leftover slots by sharpness+diversity when tier 2 doesn't cover them. Off returns fewer than saved_frame_count instead."}),
-                "tier3_sharpness_weight": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "selection_scope": (["whole_video", "per_shot"], {"default": "whole_video",
+                    "tooltip": "whole_video: the tier 1-3 cascade runs once over the whole take, with the video_* settings. per_shot: it runs inside each shot, with the shot_* settings."}),
+                "shot_count": ("INT", {"default": 6, "min": 1, "max": _MAX_CUSTOM_SHOTS,
+                    "tooltip": "per_shot only: number of shots in the take. The take is cut at its shot_count - 1 hardest scene changes."}),
+                "tier2_clip": ("CLIP", {"tooltip": "In-graph vision-language CLIP for tier 2, shared by both scopes. Leave unplugged to skip straight to tier 3 for any leftover slots."}),
+                "tier2_prompt_subject_description": ("STRING", {"default": "the subject", "multiline": True,
+                    "tooltip": "What the frames should document, shown to the tier 2 vision model. Shared by both scopes."}),
+                **_sf_cascade_inputs("video", saved=6, tier1=6, where="over the whole take"),
+                **_sf_cascade_inputs("shot", saved=2, tier1=2, where="inside each shot"),
             },
         }
 
@@ -1274,11 +1346,47 @@ class H3LookSheetsSelectFrames:
         lines.extend(notes)
         return "\n".join(lines)
 
-    def select(self, images, saved_frame_count, tier1_shots_clusters, tier2_clip=None,
-               tier2_candidates=16, tier2_prompt_subject_description="the subject", tier2_prompt_how_to_select_frames=_SF_DEFAULT_BRIEF,
-               tier2_free_vram_first=True,
-               tier2_max_token_length=400, tier2_temperature=0.2, tier2_thinking=False,
-               tier3_sharpness_diversity=True, tier3_sharpness_weight=0.35):
+    def select(self, images, selection_scope="whole_video", shot_count=6, tier2_clip=None,
+               tier2_prompt_subject_description="the subject", **settings):
+        """Run the cascade once over the take, or once inside each shot.
+
+        `settings` are the `video_*` / `shot_*` widgets; only the set of the
+        chosen scope is read, under the bare names `_cascade` takes.
+        """
+        total = int(images.shape[0])
+        per_shot = selection_scope == "per_shot"
+        prefix = "shot_" if per_shot else "video_"
+        cascade = {k[len(prefix):]: v for k, v in settings.items() if k.startswith(prefix)}
+        subject = tier2_prompt_subject_description
+
+        if not per_shot:
+            picked, origin, notes = self._cascade(images, tier2_clip, subject, **cascade)
+            picked_sorted = sorted(picked)
+            return (images[picked_sorted], self._debug(picked_sorted, origin, total, notes))
+
+        runs = _sf_split_into_shots(images, int(shot_count))
+        origin: dict[int, str] = {}
+        notes: list[str] = []
+        if len(runs) < int(shot_count):
+            notes.append(f"only {total} frames: {len(runs)} shots instead of {int(shot_count)}")
+        for number, run in enumerate(runs, 1):
+            # The cascade sees the run alone, so clustering and sharpness are
+            # relative to the shot: a soft shot (mid-turn) still gets its own
+            # best frames instead of losing every slot to a sharper one.
+            local, local_origin, local_notes = self._cascade(images[run], tier2_clip, subject, **cascade)
+            picks = sorted(run[i] for i in local)
+            origin.update({run[i]: local_origin[i] for i in local})
+            notes.append(f"shot {number}: frames {run[0]}-{run[-1]} -> {picks}")
+            notes.extend(f"  shot {number}: {note}" for note in local_notes)
+        picked_sorted = sorted(origin)
+        return (images[picked_sorted], self._debug(picked_sorted, origin, total, notes))
+
+    def _cascade(self, images, tier2_clip, tier2_prompt_subject_description,
+                 saved_frame_count=6, tier1_shots_clusters=6, tier2_candidates=16,
+                 tier2_prompt_how_to_select_frames=_SF_DEFAULT_BRIEF, tier2_free_vram_first=True,
+                 tier2_max_token_length=400, tier2_temperature=0.2, tier2_thinking=False,
+                 tier3_sharpness_diversity=True, tier3_sharpness_weight=0.35):
+        """The three tiers over `images`: returns (picked, origin, notes)."""
         total = int(images.shape[0])
         count = max(1, min(int(saved_frame_count), total))
         shots = max(1, min(int(tier1_shots_clusters), total))
@@ -1286,8 +1394,7 @@ class H3LookSheetsSelectFrames:
 
         if total <= count:
             picked = list(range(total))
-            origin = {i: "all" for i in picked}
-            return (images, self._debug(picked, origin, total, notes))
+            return picked, {i: "all" for i in picked}, notes
 
         origin: dict[int, str] = {}
         picked: list[int] = []
@@ -1357,8 +1464,7 @@ class H3LookSheetsSelectFrames:
                 fill = _sf_fill_by_diversity(images, pool, picked, remaining, tier3_sharpness_weight)
                 take(fill, "sharpness_diversity")
 
-        picked_sorted = sorted(picked)
-        return (images[picked_sorted], self._debug(picked_sorted, origin, total, notes))
+        return picked, origin, notes
 
 
 class H3LookSheetsDatasheetSettings:
