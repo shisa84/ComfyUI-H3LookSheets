@@ -20,6 +20,27 @@ rendered move, lay them out as one sheet.
 > garment, up to 4 accessories), auto-detects the person's gender, and adds
 > an **Image Aggregator** node to route everything into
 > `MiniMaxH3ReferenceToVideo`'s 9 fixed reference slots.
+>
+> **v1.2**:
+> - **Shot Config** describes each shot with one `shot_description` combo
+>   (8 body regions × 8 camera orientations) instead of separate
+>   angle/framing combos; `expression` is only written when the face is in
+>   frame. Experimental — see [Shot Config](#shot-config-h3-look-sheet).
+> - The prompt now asks for an instant hard cut to a static, locked-off
+>   camera on every shot, holds the last shot until the end of the video, and states that an
+>   outfit photo's own camera angle and pose aren't kept, only the garment.
+> - **Look Sheet Prompt - Custom Shots** gets a `shot_count` output.
+> - **Select Frames** gets a `per_shot` scope: picks frames inside each shot
+>   instead of over the whole take.
+> - New nodes: **Prompt View** (colorized prompt preview with copy and
+>   override), **Ref Image Size** (`match`/`max` combo that survives a
+>   Set/Get pair) and **Datasheet Images** (pick which images go into the
+>   datasheet, from the flow and/or added by hand).
+> - Fix: stale CUDA graph replay crash in **Describe Reference**.
+> - Example workflow adds post-processing: H3 Face Refine, a SeedVR2 upscale
+>   and the datasheet; its **Note: Model Links** lists every model and custom
+>   node it uses. New standalone `ComfyUI-H3LookSheets-Datasheet.json` to
+>   build a datasheet from existing images.
 
 📺 [Demo videos](https://www.youtube.com/playlist?list=PLR0q7a2fnl5w)
 
@@ -49,8 +70,11 @@ rendered move, lay them out as one sheet.
 
 ## The pipeline, node by node
 
-Each step feeds the next; only step 5 is a core ComfyUI/MiniMax H3 node, not
-part of this pack.
+As wired in `example_workflows/ComfyUI-H3LookSheets-2StageSamplingUpscale.json`.
+Steps 1–4, 7, 9 and 10 are this pack. Step 5 is core ComfyUI/MiniMax H3 (plus
+a latent upscaler pack), steps 6 and 8 are optional post-processing from
+other packs. The workflow's **Note: Model Links** lists every model and
+custom node used.
 
 1. **Load the reference photos** (`LoadImage` — the person, usually one
    photo, and the look, one or several photos: front/back of a garment,
@@ -61,35 +85,60 @@ part of this pack.
 3. **Route the images**: both `images` outputs go into **Image Aggregator**
    (`images_person`, `images_outfit`) → `ref_image_0` … `ref_image_8`, in the
    order the prompt numbers them.
-4. **Write the prompt**: both `description` outputs, plus `Shot Config` ×N for
-   however many shots the sheet needs, go into **Look Sheet Prompt - Custom
-   Shots** → `prompt`.
-5. **Generate**: `prompt`, the 9 `ref_image_N`, `clip`, `vae` and `audio_vae`
-   go into `MiniMaxH3ReferenceToVideo` (core node), then through your usual
-   sampler and VAE decode → a batch of decoded frames.
-6. **Pick the keepers**: the decoded frames go into **Select Frames** →
-   `frames`.
-7. **Lay them out**: `frames` goes into **Datasheet Settings** → `sheet`
-   (IMAGE), the finished contact sheet.
+4. **Write the prompt**: both `description` outputs, plus one **Shot Config**
+   per shot, go into **Look Sheet Prompt - Custom Shots** → `prompt` +
+   `shot_count`. **Prompt View** shows the prompt colorized and can override
+   it before it reaches the sampler.
+5. **Generate**: `prompt` and the 9 `ref_image_N` go into the **2 Stage
+   Sampling + Upscale** subgraph — `MiniMaxH3ReferenceToVideo` (its
+   `ref_image_size` set by **Ref Image Size**), a first pass at low
+   resolution, `MinimaxH3LatentUpscaler3D`, a second pass, VAE decode → the
+   decoded frames (also saved as a video).
+6. **Refine the face** (optional): the **H3 Face Refine** subgraph
+   ([ComfyUI-H3-FaceRefine](https://github.com/Carasibana/ComfyUI-H3-FaceRefine))
+   re-renders the face on every frame → refined frames (also saved as a
+   video).
+7. **Pick the keepers**: the frames go into **Select Frames**, with
+   `shot_count` from step 4 for the `per_shot` scope → `frames` (saved).
+8. **Upscale** (optional): `frames`, turned into an image list, go through
+   the **Upscale Image (SeedVR2 7B Int8)** subgraph (core SeedVR2 nodes) →
+   upscaled frames (saved).
+9. **Choose the images**: the upscaled frames go into **Datasheet Images**,
+   where each one can be switched on/off and more can be added by hand →
+   `images`.
+10. **Lay them out**: `images` goes into **Datasheet Settings** → `sheet`
+    (IMAGE), the finished contact sheet, saved under `h3looksheet/datasheet`.
 
 ```
-LoadImage (person) ─► Describe Reference (target=person) ─► description ─────────┐
-                                        │ images                                  │
-LoadImage (outfit) ×N ─► Describe Reference (target=outfit) ─► description ──────┤
-                                        │ images                                  ▼
-                                        ▼                 Look Sheet Prompt - Custom Shots ─► prompt
-                                Image Aggregator ─► ref_image_0…8                 │
-                                        │                                         │
-                                        └──────────────► MiniMaxH3ReferenceToVideo ◄┘
-                                                                  │
-                                                                  ▼
-                                                   sampler ─► VAE decode ─► decoded frames
-                                                                  │
-                                                                  ▼
-                                                          Select Frames ─► frames
-                                                                  │
-                                                                  ▼
-                                                       Datasheet Settings ─► sheet (IMAGE)
+LoadImage (person) ─► Describe Reference (target=person) ─► description ──────┐
+                               │ images                                       │
+LoadImage (outfit) ×N ─► Describe Reference (target=outfit) ─► description ───┤
+                               │ images                                       │
+                               ▼                         Shot Config ×N ──────┤
+                       Image Aggregator                                       ▼
+                               │ ref_image_0…8      Look Sheet Prompt - Custom Shots
+                               │                       │ prompt         │ shot_count
+                               │                       ▼                │
+                               │                  Prompt View           │
+                               │                       │ prompt         │
+                               ▼                       ▼                │
+       2 Stage Sampling + Upscale (MiniMaxH3ReferenceToVideo,           │
+       1st pass ─► latent upscale ─► 2nd pass ─► VAE decode)            │
+                               │ frames                                 │
+                               ▼                                        │
+                   H3 Face Refine (optional)                            │
+                               │ frames                                 │
+                               ▼                                        │
+                         Select Frames ◄────────────────────────────────┘
+                               │ frames
+                               ▼
+               Upscale Image - SeedVR2 (optional)
+                               │ images
+                               ▼
+                       Datasheet Images
+                               │ images
+                               ▼
+                      Datasheet Settings ─► sheet (IMAGE)
 ```
 
 ---
@@ -99,10 +148,13 @@ LoadImage (outfit) ×N ─► Describe Reference (target=outfit) ─► descript
 | Node | Category | What it does |
 |---|---|---|
 | **Look Sheet Prompt - Custom Shots (H3)** | `H3LookSheets` | Writes the ref2va prompt from a freely chosen list of 1–15 shots (`H3LookSheetsCustomPrompt`) |
-| **Shot Config (H3 Look Sheet)** | `H3LookSheets` | One shot's angle/framing/expression, packed for the node above (`H3LookSheetsShotConfig`) |
+| **Shot Config (H3 Look Sheet)** | `H3LookSheets` | One shot's description/expression, packed for the node above (`H3LookSheetsShotConfig`) |
 | **Describe Reference (H3 Look Sheet)** | `H3LookSheets` | One-sentence vision description per reference photo (up to 8), with retry and fallback prompts (`H3LookSheetsDescribe`) |
 | **Image Aggregator (H3 Look Sheet)** | `H3LookSheets` | Routes the person and outfit images into `MiniMaxH3ReferenceToVideo`'s 9 `ref_image` slots (`H3ImageAggregator`) |
+| **Prompt View (H3 Look Sheet)** | `H3LookSheets` | Colorized read-only preview of a prompt, with a copy button and an edit-a-copy override (`H3LookSheetsPromptView`) |
+| **Ref Image Size (match/max)** | `H3LookSheets` | A `match`/`max` picker for `MiniMaxH3ReferenceToVideo`'s `ref_image_size`, output as a real combo so it survives a Set/Get pair (`H3LookSheetsRefImageSize`) |
 | **Select Frames (H3 Look Sheet)** | `H3LookSheets` | Picks reference frames out of the rendered take (`H3LookSheetsSelectFrames`) |
+| **Datasheet Images (H3 Look Sheet)** | `H3LookSheets` | Chooses which images go into the datasheet, from the flow and/or added by hand (`H3LookSheetsDatasheetImages`) |
 | **Datasheet Settings (H3 Look Sheet)** | `H3LookSheets` | Lays the picked frames out as one contact-sheet image (`H3LookSheetsDatasheetSettings`) |
 
 ---
@@ -135,18 +187,31 @@ outfit shown" so the numbering never shifts.
 | `video_duration_seconds` | FLOAT | The take's real length — feed it from whatever sets `length` on `MiniMaxH3ReferenceToVideo`, divided by however many shots are connected |
 | `shot_0` … `shot_14` | STRING (Autogrow) | Each fed by a **Shot Config** node |
 
+| Output | Type | Notes |
+|---|---|---|
+| `prompt` | STRING | The finished ref2va prompt |
+| `shot_count` | INT | How many shots the prompt describes. Wire it into **Select Frames**' `shot_count` so `per_shot` always cuts the take into the right number of shots |
+
 ### Shot Config (H3 Look Sheet)
 
-Three inline dropdowns, packed into one string for the node above.
+**Experimental** — two inline dropdowns, packed into one string for the
+node above.
 
 | Combo | Options |
 |---|---|
-| `angle` | front, front 3/4 left, front 3/4 right, left profile, right profile, back 3/4 left, back 3/4 right, back |
-| `framing` | extreme wide shot, wide shot (full body), medium wide shot (knees-up), medium shot (waist-up), medium close-up (chest-up), close-up (shoulders/face), extreme close-up (eyes/detail) |
+| `shot_description` | one combo covering body region and camera orientation together, e.g. `Lower Legs - Back` (8 regions × 8 orientations = 64 options) |
 | `expression` | neutral, happy, smiling, sad, angry, surprised, scared, disgusted, shy/embarrassed, confident, serious, laughing, crying, smirking, confused |
 
-Pick angle and framing together with the subject visible — e.g. `back` +
-`close-up (shoulders/face)` shows no face for the expression to read on.
+`expression` only shows up in the prompt when the region includes the
+head (`Full Body`, `Upper Body`, `Head`) and the orientation faces the
+camera (`Front`, `Front 3/4 Left`, `Front 3/4 Right`) — elsewhere the
+face isn't in frame, so stating an expression would ask for something
+that can't be read.
+
+This replaces the previous `angle` + `framing` + `camera_target`
+combos: composing them independently didn't hold up well across
+testing (see `camera_position_tests/report.txt`), so each shot is now
+described as one literal, physical framing instead.
 
 ---
 
@@ -209,12 +274,42 @@ warning. `images` returns the same images as one list.
 
 ---
 
+### Prompt View (H3 Look Sheet)
+
+A preview of the prompt right before it reaches `MiniMaxH3ReferenceToVideo`:
+`<Picture N>`, `<Subject N>`, `<Audio N>`, `[Shot N]` and the section headers
+(`subject_definitions`, `summary`, `retention_analysis`,
+`detailed_description`, `overall_soundscape`, `non_diegetic_music`) are
+colorized, and a **Copy** button copies the text shown.
+
+Read-only by default, always mirroring whatever is wired into `prompt`.
+**Override prompt** unlocks it for editing a copy in place — the node then
+outputs that edited copy instead, until **Revert to original** is clicked to
+go back to mirroring `prompt` again.
+
+| | |
+|---|---|
+| Input | `prompt` (STRING, force input) — wire it from **Look Sheet Prompt - Custom Shots** or anywhere else a prompt string comes from |
+| Output | `prompt` (STRING) — the edited copy while overridden, otherwise the input unchanged |
+
+---
+
+### Ref Image Size (match/max)
+
+A dropdown for `MiniMaxH3ReferenceToVideo`'s `ref_image_size` (`match` /
+`max`), with a real combo output — so it can be routed through a KJNodes
+Set/Get pair to drive several `MiniMaxH3ReferenceToVideo` nodes from one
+place. A plain `Primitive` or `STRING` node cannot connect to a combo input;
+this node can.
+
+---
+
 ### Select Frames (H3 Look Sheet)
 
-Picks `saved_frame_count` reference frames out of the rendered take, via a
-fixed three-tier cascade:
+Picks reference frames out of the rendered take, via a fixed three-tier
+cascade, run either once over the whole take or once inside each shot:
 
-1. **Tier 1 — cluster by content.** Groups the leftover frames into
+1. **Tier 1 — cluster by content.** Groups the frames into
    `tier1_shots_clusters` visually distinct clusters, takes the sharpest
    frame of each. Deterministic, always runs.
 2. **Tier 2 — vision-informed diversity fill.** If slots remain
@@ -225,20 +320,39 @@ fixed three-tier cascade:
    but does not decide which frames are kept.
 3. **Tier 3 — sharpness + diversity fallback.** Fills whatever tier 2
    didn't, the same diversity-first way, so the node always returns exactly
-   `saved_frame_count` frames (or every frame, if the video has fewer).
+   `saved_frame_count` frames (or every frame, if there are fewer).
+
+`selection_scope` picks what the cascade runs over, and each scope has its
+own copy of every setting:
+
+| `selection_scope` | Runs over | Settings read | Frames returned |
+|---|---|---|---|
+| `whole_video` (default) | the whole take, once | `video_*` | `video_saved_frame_count` |
+| `per_shot` | each shot, separately | `shot_count` and `shot_*` | `shot_count × shot_saved_frame_count` |
 
 | Input | Tier | Notes |
 |---|---|---|
 | `images` | — | The rendered take (decoded frames) |
-| `saved_frame_count` | — | Total frames returned |
-| `tier1_shots_clusters` | 1 | Distinct views to guarantee. Set equal to `saved_frame_count` for a fully deterministic run — tiers 2/3 never trigger |
-| `tier2_clip` | 2 | In-graph vision CLIP. Leave unplugged to skip straight to tier 3 |
-| `tier2_candidates` | 2 | Clusters formed from the leftover pool for the shortlist |
-| `tier2_prompt_subject_description` / `tier2_prompt_how_to_select_frames` | 2 | Text shown to the vision model, logged in `debug` |
-| `tier2_free_vram_first` | 2 | Unload other resident models before the tier-2 vision call |
-| `tier2_max_token_length` / `tier2_temperature` / `tier2_thinking` | 2 | Passed to the vision call |
-| `tier3_sharpness_diversity` | 3 | Off returns fewer than `saved_frame_count` instead of filling |
-| `tier3_sharpness_weight` | 3 | Balance between sharpness and diversity when filling |
+| `selection_scope` | — | `whole_video` or `per_shot`, see above |
+| `shot_count` | per_shot | Number of shots in the take — wire it from **Look Sheet Prompt - Custom Shots**' `shot_count` output |
+| `tier2_clip` | 2 | In-graph vision CLIP, shared by both scopes. Leave unplugged to skip straight to tier 3 |
+| `<scope>_saved_frame_count` | — | Frames returned: for the whole take, or for each shot |
+| `<scope>_tier1_shots_clusters` | 1 | Distinct views to guarantee. Set equal to `<scope>_saved_frame_count` for a fully deterministic run — tiers 2/3 never trigger |
+| `<scope>_tier2_candidates` | 2 | Clusters formed from the leftover pool for the shortlist |
+| `tier2_prompt_subject_description` | 2 | What the frames should document, shown to the vision model. Shared by both scopes |
+| `<scope>_tier2_prompt_how_to_select_frames` | 2 | Selection criteria shown to the vision model |
+| `<scope>_tier2_free_vram_first` | 2 | Unload other resident models before the tier-2 vision call |
+| `<scope>_tier2_max_token_length` / `<scope>_tier2_temperature` / `<scope>_tier2_thinking` | 2 | Passed to the vision call |
+| `<scope>_tier3_sharpness_diversity` | 3 | Off returns fewer than `<scope>_saved_frame_count` instead of filling |
+| `<scope>_tier3_sharpness_weight` | 3 | Balance between sharpness and diversity when filling |
+
+`<scope>` is `video` or `shot`. The `shot_*` set defaults to 2 frames and 2
+clusters per shot, the `video_*` set to 6 and 6.
+
+The node only shows the inputs the current scope reads: the set of the other
+scope is hidden and `shot_count` only shows for `per_shot`. `tier2_clip` and
+`tier2_prompt_subject_description` always show, since both scopes use them.
+An input that has a link plugged into it always stays visible.
 
 `debug` (STRING output) lists, per returned frame, which tier picked it:
 
@@ -251,12 +365,59 @@ tier 2 shortlist shown to model (16): [...]
 tier 2 raw reply (json_ok=True, 153 chars): {"picks": [1, 2, ...], "why": "..."}
 ```
 
+#### `per_shot` scope
+
+The take is cut into `shot_count` shots at its hardest scene changes, then
+the cascade runs inside each shot on its own frames, so every shot gets its
+own `shot_saved_frame_count` frames and nothing competes across shots. The
+result is in video order.
+
+`shot_count` must match the real number of shots: too low merges two shots,
+too high splits one. A shot shorter than `shot_saved_frame_count` returns all
+its frames.
+
+With `tier2_clip` wired and more slots than clusters, tier 2 makes one
+vision call per shot, not one per take.
+
+`debug` lists the frame range of each detected shot, what was kept from it,
+and that shot's own tier notes:
+
+```
+12/120 frames — 6 Tier 1: cluster (by content), 6 Tier 3: sharpness+diversity (fallback)
+  frame 3: Tier 1: cluster (by content)
+  ...
+shot 1: frames 0-19 -> [3, 14]
+  shot 1: tier 2 skipped: no clip connected
+shot 2: frames 20-44 -> [27, 39]
+```
+
+---
+
+### Datasheet Images (H3 Look Sheet)
+
+Chooses which images go into the datasheet. Works inside the main workflow
+(images coming from the flow) or on its own in a new workflow (images added
+by hand) — see `example_workflows/ComfyUI-H3LookSheets-Datasheet.json`.
+
+- **`images`** (optional): an image list or a batch, e.g. the frames from
+  **Select Frames** or from an upscale. Their thumbnails show up after the
+  node has run once.
+- **Add images**: uploads one or more images into `input/h3looksheets/`;
+  each gets a **×** to remove it.
+- **Click a thumbnail** to switch it on/off. **All** / **None** switch every
+  image at once; the counter shows how many are kept. The choice is saved
+  with the workflow.
+
+| Output | Notes |
+|---|---|
+| `images` | The kept images as one batch: flow images first, then added ones. Each is converted to RGB and resized to the first kept image's size (the datasheet stretches every tile to that aspect ratio anyway) |
+
 ---
 
 ### Datasheet Settings (H3 Look Sheet)
 
-Lays the frames from **Select Frames** out as one contact-sheet image. No
-per-tile labels, no vision call.
+Lays the frames from **Datasheet Images** (or straight from **Select
+Frames**) out as one contact-sheet image. No per-tile labels, no vision call.
 
 | Input | Notes |
 |---|---|
@@ -271,7 +432,10 @@ per-tile labels, no vision call.
 
 **Models**: MiniMax H3 in `ref2va` mode (`MiniMaxH3ReferenceToVideo`) plus a
 vision-language CLIP that supports `.generate()` (Qwen3-VL) for **Describe
-Reference** and (optionally) tier 2 of **Select Frames**.
+Reference** and (optionally) tier 2 of **Select Frames**. The example
+workflow's post-processing needs more models and custom nodes (latent
+upscaler, H3 Face Refine, SeedVR2, KJNodes, Impact Pack…): its **Note: Model
+Links** lists them all with download links.
 
 **Python**: nothing outside what ComfyUI already ships (`torch`, `numpy`,
 `Pillow`) — no `requirements.txt` needed.
@@ -287,8 +451,12 @@ git clone https://github.com/shisa84/ComfyUI-H3LookSheets
 
 Restart ComfyUI. The nodes appear under the **H3LookSheets** category.
 
-Load a graph from `example_workflows/` (canvas format, drag onto the canvas)
-to see a complete pipeline wired up.
+Load a graph from `example_workflows/` (canvas format, drag onto the canvas):
+
+| Workflow | What it is |
+|---|---|
+| `ComfyUI-H3LookSheets-2StageSamplingUpscale.json` | The complete pipeline: describe, prompt, 2-stage sampling + latent upscale, Select Frames, H3 Face Refine, SeedVR2 upscale, datasheet. Its **Note: Model Links** lists every model and custom node it needs |
+| `ComfyUI-H3LookSheets-Datasheet.json` | Datasheet only: **Datasheet Images** → **Datasheet Settings** → save, for images you already have |
 
 ---
 

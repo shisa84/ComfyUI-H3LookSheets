@@ -20,12 +20,15 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import random
 import re
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+import folder_paths
 from comfy_api.latest import io
 from comfy_extras.nodes_textgen import TextGenerate
 
@@ -36,14 +39,6 @@ try:
     import comfy.model_prefetch as model_prefetch
 except ImportError:
     model_prefetch = None
-
-#: English word for small shot counts (5 or 6 in practice) — reads naturally
-#: in the intro sentence ("across all six shots") instead of a bare digit.
-_COUNT_WORDS = {
-    1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
-    8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
-    13: "thirteen", 14: "fourteen", 15: "fifteen",
-}
 
 #: Only two manual choices — each reference photo holds exactly one person,
 #: never an ambiguous group, so there's no case a they/them override serves.
@@ -1010,6 +1005,39 @@ def _sf_cluster_pool(images: torch.Tensor, pool: list[int], k: int) -> list[list
     return [[pool[i] for i in g] for g in sub_groups]
 
 
+def _sf_split_into_shots(images: torch.Tensor, shots: int) -> list[list[int]]:
+    """Cut the take into `shots` contiguous runs at its hardest scene changes.
+
+    A cut is a big jump between two neighbouring frames' descriptors, so the
+    `shots - 1` biggest jumps are the boundaries. Splitting by time would be
+    wrong for the same reason `_sf_cluster_by_content` ignores time: H3 does
+    not hold the shot lengths the prompt asks for.
+
+    Cuts closer than `min_gap` frames count as one. The video VAE compresses
+    time, so one real cut can show up as two neighbouring jumps (frame -> blend
+    -> frame); without this a single cut would eat two of the `shots - 1`
+    slots and silently merge two real shots into one.
+    """
+    total = int(images.shape[0])
+    shots = max(1, min(shots, total))
+    if shots == 1:
+        return [list(range(total))]
+
+    desc = _sf_descriptors(images, 32)
+    jumps = (desc[1:] - desc[:-1]).norm(dim=1)  # jumps[i]: frame i -> frame i + 1
+    min_gap = max(1, min(4, total // shots))
+
+    cuts: list[int] = []
+    for i in torch.argsort(jumps, descending=True).tolist():
+        if all(abs(i - c) >= min_gap for c in cuts):
+            cuts.append(i)
+            if len(cuts) == shots - 1:
+                break
+
+    edges = [0, *sorted(c + 1 for c in cuts), total]
+    return [list(range(a, b)) for a, b in zip(edges, edges[1:])]
+
+
 def _sf_fill_by_diversity(images: torch.Tensor, pool: list[int], chosen: list[int],
                            want: int, sharpness_weight: float) -> list[int]:
     """Greedy farthest-point fill from `pool`: sharp, and far from `chosen`.
@@ -1184,8 +1212,42 @@ _SF_LEVEL_LABELS = {
     "cluster": "Tier 1: cluster (by content)",
     "vision": "Tier 2: vision (clip, diversity-picked)",
     "sharpness_diversity": "Tier 3: sharpness+diversity (fallback)",
-    "all": "kept (fewer frames in the video than requested)",
+    "all": "kept (fewer frames than requested)",
 }
+
+
+def _sf_cascade_inputs(prefix: str, saved: int, tier1: int, where: str) -> dict:
+    """The tier 1-3 widgets, named `<prefix>_<setting>` — one set per scope.
+
+    `video_*` drives the cascade over the whole take, `shot_*` drives it
+    inside each shot. The widget names minus the prefix are the keyword
+    arguments of `H3LookSheetsSelectFrames._cascade`. `tier2_clip` and
+    `tier2_prompt_subject_description` are not in here: they describe the
+    take, not how to pick from it, so both scopes share one of each (and the
+    subject is usually fed by a link, which would otherwise need wiring twice).
+    """
+    return {
+        f"{prefix}_saved_frame_count": ("INT", {"default": saved, "min": 1, "max": 32,
+            "tooltip": f"Total frames returned {where}. More than the tier 1 clusters leaves slots for vision/spread."}),
+        # --- tier 1: cluster by content ---
+        f"{prefix}_tier1_shots_clusters": ("INT", {"default": tier1, "min": 1, "max": 32,
+            "tooltip": f"Distinct views to guarantee {where} via clustering — tier 1."}),
+        # --- tier 2: vision judge (only if tier2_clip is wired) ---
+        f"{prefix}_tier2_candidates": ("INT", {"default": 16, "min": 4, "max": 32,
+            "tooltip": "Clusters formed from the leftover pool — also the shortlist size shown to the vision model. Each is represented by its sharpest frame, so this is both the diversity and the readability knob."}),
+        f"{prefix}_tier2_prompt_how_to_select_frames": ("STRING", {"default": _SF_DEFAULT_BRIEF, "multiline": True}),
+        f"{prefix}_tier2_free_vram_first": ("BOOLEAN", {"default": True,
+            "tooltip": "Unload other resident models before the tier-2 vision call."}),
+        f"{prefix}_tier2_max_token_length": ("INT", {"default": 400, "min": 64, "max": 4096}),
+        f"{prefix}_tier2_temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.05}),
+        f"{prefix}_tier2_thinking": ("BOOLEAN", {"default": False,
+            "tooltip": "Let the vision model reason before answering. The reasoning block is stripped before parsing picks either way."}),
+        # --- tier 3: sharpness + diversity fallback ---
+        f"{prefix}_tier3_sharpness_diversity": ("BOOLEAN", {"default": True,
+            "tooltip": "Fill leftover slots by sharpness+diversity when tier 2 doesn't cover them. Off returns fewer than the saved frame count instead."}),
+        f"{prefix}_tier3_sharpness_weight": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "Balance between sharpness and diversity when filling."}),
+    }
 
 
 class H3LookSheetsSelectFrames:
@@ -1211,36 +1273,39 @@ class H3LookSheetsSelectFrames:
     `debug` lists, for every returned frame, which of the three tiers chose
     it — so a run with `count == shots` reads "cluster" on every line, and
     you know at a glance whether `clip` ever got exercised at all.
+
+    `selection_scope` picks what the cascade runs over, with its own copy of
+    every setting: `video_*` runs it once over the whole take, `shot_*` cuts
+    the take into `shot_count` runs at its scene changes and runs it inside
+    each run, so every shot is represented equally instead of the whole
+    video competing for the slots. `shot_count` is its own input rather
+    than `video_tier1_shots_clusters`: that one is a clustering knob and is
+    routinely set to something other than the number of shots (e.g. 12
+    clusters over 6 shots).
     """
 
     @classmethod
     def INPUT_TYPES(cls):
+        # Dict order is the node's top-to-bottom widget order, and saved
+        # workflows store widget values by position — so a reorder or a new
+        # widget needs the migration in web/h3looksheets_select_frames.js.
+        # Everything but `images` is optional (with a default in `select`) so
+        # that API prompts exported before selection_scope existed still
+        # validate.
         return {
             "required": {
                 "images": ("IMAGE",),
-                "saved_frame_count": ("INT", {"default": 6, "min": 1, "max": 32,
-                    "tooltip": "Total frames returned. count > shots leaves slots for vision/spread."}),
-                # --- tier 1: cluster by content ---
-                "tier1_shots_clusters": ("INT", {"default": 6, "min": 1, "max": 32,
-                    "tooltip": "Distinct views to guarantee via clustering — tier 1."}),
             },
             "optional": {
-                # --- tier 2: vision judge (only if clip is wired) ---
-                "tier2_clip": ("CLIP", {"tooltip": "In-graph vision-language CLIP for tier 2. Leave unplugged to skip straight to tier 3 for any leftover slots."}),
-                "tier2_candidates": ("INT", {"default": 16, "min": 4, "max": 32,
-                    "tooltip": "Clusters formed from the leftover pool — also the shortlist size shown to the vision model. Each is represented by its sharpest frame, so this is both the diversity and the readability knob."}),
-                "tier2_prompt_subject_description": ("STRING", {"default": "the subject", "multiline": True}),
-                "tier2_prompt_how_to_select_frames": ("STRING", {"default": _SF_DEFAULT_BRIEF, "multiline": True}),
-                "tier2_free_vram_first": ("BOOLEAN", {"default": True,
-                    "tooltip": "Unload other resident models before the tier-2 vision call."}),
-                "tier2_max_token_length": ("INT", {"default": 400, "min": 64, "max": 4096}),
-                "tier2_temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "tier2_thinking": ("BOOLEAN", {"default": False,
-                    "tooltip": "Let the vision model reason before answering. The reasoning block is stripped before parsing picks either way."}),
-                # --- tier 3: sharpness + diversity fallback ---
-                "tier3_sharpness_diversity": ("BOOLEAN", {"default": True,
-                    "tooltip": "Fill leftover slots by sharpness+diversity when tier 2 doesn't cover them. Off returns fewer than saved_frame_count instead."}),
-                "tier3_sharpness_weight": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "selection_scope": (["whole_video", "per_shot"], {"default": "whole_video",
+                    "tooltip": "whole_video: the tier 1-3 cascade runs once over the whole take, with the video_* settings. per_shot: it runs inside each shot, with the shot_* settings."}),
+                "shot_count": ("INT", {"default": 6, "min": 1, "max": _MAX_CUSTOM_SHOTS,
+                    "tooltip": "per_shot only: number of shots in the take — wire it from Look Sheet Prompt - Custom Shots' shot_count output. The take is cut at its shot_count - 1 hardest scene changes."}),
+                "tier2_clip": ("CLIP", {"tooltip": "In-graph vision-language CLIP for tier 2, shared by both scopes. Leave unplugged to skip straight to tier 3 for any leftover slots."}),
+                "tier2_prompt_subject_description": ("STRING", {"default": "the subject", "multiline": True,
+                    "tooltip": "What the frames should document, shown to the tier 2 vision model. Shared by both scopes."}),
+                **_sf_cascade_inputs("video", saved=6, tier1=6, where="over the whole take"),
+                **_sf_cascade_inputs("shot", saved=2, tier1=2, where="inside each shot"),
             },
         }
 
@@ -1274,11 +1339,47 @@ class H3LookSheetsSelectFrames:
         lines.extend(notes)
         return "\n".join(lines)
 
-    def select(self, images, saved_frame_count, tier1_shots_clusters, tier2_clip=None,
-               tier2_candidates=16, tier2_prompt_subject_description="the subject", tier2_prompt_how_to_select_frames=_SF_DEFAULT_BRIEF,
-               tier2_free_vram_first=True,
-               tier2_max_token_length=400, tier2_temperature=0.2, tier2_thinking=False,
-               tier3_sharpness_diversity=True, tier3_sharpness_weight=0.35):
+    def select(self, images, selection_scope="whole_video", shot_count=6, tier2_clip=None,
+               tier2_prompt_subject_description="the subject", **settings):
+        """Run the cascade once over the take, or once inside each shot.
+
+        `settings` are the `video_*` / `shot_*` widgets; only the set of the
+        chosen scope is read, under the bare names `_cascade` takes.
+        """
+        total = int(images.shape[0])
+        per_shot = selection_scope == "per_shot"
+        prefix = "shot_" if per_shot else "video_"
+        cascade = {k[len(prefix):]: v for k, v in settings.items() if k.startswith(prefix)}
+        subject = tier2_prompt_subject_description
+
+        if not per_shot:
+            picked, origin, notes = self._cascade(images, tier2_clip, subject, **cascade)
+            picked_sorted = sorted(picked)
+            return (images[picked_sorted], self._debug(picked_sorted, origin, total, notes))
+
+        runs = _sf_split_into_shots(images, int(shot_count))
+        origin: dict[int, str] = {}
+        notes: list[str] = []
+        if len(runs) < int(shot_count):
+            notes.append(f"only {total} frames: {len(runs)} shots instead of {int(shot_count)}")
+        for number, run in enumerate(runs, 1):
+            # The cascade sees the run alone, so clustering and sharpness are
+            # relative to the shot: a soft shot (mid-turn) still gets its own
+            # best frames instead of losing every slot to a sharper one.
+            local, local_origin, local_notes = self._cascade(images[run], tier2_clip, subject, **cascade)
+            picks = sorted(run[i] for i in local)
+            origin.update({run[i]: local_origin[i] for i in local})
+            notes.append(f"shot {number}: frames {run[0]}-{run[-1]} -> {picks}")
+            notes.extend(f"  shot {number}: {note}" for note in local_notes)
+        picked_sorted = sorted(origin)
+        return (images[picked_sorted], self._debug(picked_sorted, origin, total, notes))
+
+    def _cascade(self, images, tier2_clip, tier2_prompt_subject_description,
+                 saved_frame_count=6, tier1_shots_clusters=6, tier2_candidates=16,
+                 tier2_prompt_how_to_select_frames=_SF_DEFAULT_BRIEF, tier2_free_vram_first=True,
+                 tier2_max_token_length=400, tier2_temperature=0.2, tier2_thinking=False,
+                 tier3_sharpness_diversity=True, tier3_sharpness_weight=0.35):
+        """The three tiers over `images`: returns (picked, origin, notes)."""
         total = int(images.shape[0])
         count = max(1, min(int(saved_frame_count), total))
         shots = max(1, min(int(tier1_shots_clusters), total))
@@ -1286,8 +1387,7 @@ class H3LookSheetsSelectFrames:
 
         if total <= count:
             picked = list(range(total))
-            origin = {i: "all" for i in picked}
-            return (images, self._debug(picked, origin, total, notes))
+            return picked, {i: "all" for i in picked}, notes
 
         origin: dict[int, str] = {}
         picked: list[int] = []
@@ -1357,8 +1457,7 @@ class H3LookSheetsSelectFrames:
                 fill = _sf_fill_by_diversity(images, pool, picked, remaining, tier3_sharpness_weight)
                 take(fill, "sharpness_diversity")
 
-        picked_sorted = sorted(picked)
-        return (images[picked_sorted], self._debug(picked_sorted, origin, total, notes))
+        return picked, origin, notes
 
 
 class H3LookSheetsDatasheetSettings:
@@ -1392,44 +1491,197 @@ class H3LookSheetsDatasheetSettings:
         return (_sf_pils_to_tensor([sheet]),)
 
 
+DatasheetImagesState = io.Custom("H3LOOKSHEETS_DATASHEET_IMAGES")
+
+_DS_THUMB_SIZE = 256
+
+
+def _ds_load_added(name: str, subfolder: str) -> torch.Tensor:
+    from PIL import Image, ImageOps
+    input_dir = os.path.abspath(folder_paths.get_input_directory())
+    path = os.path.abspath(os.path.join(input_dir, subfolder, name))
+    if os.path.commonpath((input_dir, path)) != input_dir:
+        raise ValueError(f"Datasheet Images: {subfolder}/{name} is outside the input folder")
+    with Image.open(path) as img:
+        pil = ImageOps.exif_transpose(img).convert("RGB")
+    return torch.from_numpy(np.asarray(pil, dtype=np.float32) / 255.0)
+
+
+def _ds_save_thumbs(frames: list[torch.Tensor]) -> list[dict]:
+    temp_dir = folder_paths.get_temp_directory()
+    prefix = "h3looksheets_datasheet_" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
+    folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(prefix, temp_dir)
+    thumbs = []
+    for i, frame in enumerate(frames):
+        pil = _sf_tensor_to_pils(frame[None])[0]
+        pil.thumbnail((_DS_THUMB_SIZE, _DS_THUMB_SIZE))
+        file = f"{filename}_{counter + i:05}_.png"
+        pil.save(os.path.join(folder, file), compress_level=1)
+        thumbs.append({"filename": file, "subfolder": subfolder, "type": "temp"})
+    return thumbs
+
+
+class H3LookSheetsDatasheetImages(io.ComfyNode):
+    """Pick which images go into the datasheet.
+
+    Takes the frames coming from the flow (optional; an image list or a
+    batch, sizes may differ) plus any images added
+    with the node's "Add images" button (uploaded to input/h3looksheets), and
+    lets each one be switched on/off by clicking its thumbnail. Incoming
+    frames only get thumbnails after the node has run once.
+
+    Every kept image is resized to the first kept one's size so they fit in
+    one batch — the datasheet montage stretches every tile to the first
+    frame's aspect ratio anyway, so the sheet looks the same.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="H3LookSheetsDatasheetImages",
+            display_name="Datasheet Images (H3 Look Sheet)",
+            category="H3LookSheets",
+            is_input_list=True,
+            inputs=[
+                io.Image.Input("images", optional=True),
+                DatasheetImagesState.Input("image_state"),
+            ],
+            outputs=[io.Image.Output(display_name="images")],
+        )
+
+    @classmethod
+    def execute(cls, image_state, images=None) -> io.NodeOutput:
+        state = json.loads(image_state[0]) if image_state[0] else {}
+        disabled = set(state.get("disabled", []))
+
+        # SeedVR2 hands back RGBA; the datasheet is RGB anyway.
+        frames = [batch[i, ..., :3] for batch in images or [] for i in range(batch.shape[0])]
+        kept = [f for i, f in enumerate(frames) if f"flow:{i}" not in disabled]
+        for item in state.get("added", []):
+            name, subfolder = item["name"], item.get("subfolder", "")
+            if f"input:{subfolder}/{name}" not in disabled:
+                kept.append(_ds_load_added(name, subfolder))
+        if not kept:
+            raise ValueError("Datasheet Images: no image selected")
+
+        height, width = kept[0].shape[0], kept[0].shape[1]
+        batch = torch.stack([
+            t if t.shape[:2] == (height, width) else
+            F.interpolate(t.movedim(-1, 0)[None], size=(height, width), mode="bilinear",
+                          antialias=True)[0].movedim(0, -1)
+            for t in kept
+        ])
+        return io.NodeOutput(batch, ui={"h3looksheets_flow_images": _ds_save_thumbs(frames)})
+
+
 # --------------------------------------------------------------------------
 # H3LookSheetsShotConfig / H3LookSheetsCustomPrompt
 #
-# Any number of shots (up to 15), each with its own angle, framing and
+# Any number of shots (up to 15), each with its own shot description and
 # expression, instead of a hardcoded per-shot template.
 #
 # Autogrow (the "plug one, the next slot appears" mechanism) only works on
-# socket inputs, and forces every widget it wraps into one too — three
-# Autogrow'd combos per shot would mean 3x sockets and no ready-made node to
+# socket inputs, and forces every widget it wraps into one too — two
+# Autogrow'd combos per shot would mean 2x sockets and no ready-made node to
 # feed a bare combo value into a socket. H3LookSheetsShotConfig sidesteps
-# that: its own angle/framing/expression combos stay ordinary inline
-# widgets (it isn't itself using Autogrow), and it packs all three into one
+# that: its own shot_description/expression combos stay ordinary inline
+# widgets (it isn't itself using Autogrow), and it packs both into one
 # string — so H3LookSheetsCustomPrompt only needs ONE Autogrow socket per
-# shot, fed by one of these nodes, not three.
+# shot, fed by one of these nodes, not two.
 # --------------------------------------------------------------------------
 
-_ANGLE_PHRASES = {
-    "front": "facing the camera directly",
-    "front 3/4 left": "turned three-quarters toward camera-left, most of the face and body visible",
-    "front 3/4 right": "turned three-quarters toward camera-right, most of the face and body visible",
-    "left profile": "turned to show the left profile",
-    "right profile": "turned to show the right profile",
-    "back 3/4 left": "turned mostly away, seen three-quarters from the back on the left side",
-    "back 3/4 right": "turned mostly away, seen three-quarters from the back on the right side",
-    "back": "facing away from the camera, back to camera",
+#: EXPERIMENTAL, uncommitted - replaces angle/framing/camera_target with
+#: one combo. A night of testing (camera_position_tests/report.txt)
+#: showed that composing independent phrase fragments (angle + framing +
+#: camera_target, same as the earlier camera_angle/camera_height/
+#: camera_target attempt) doesn't compose reliably - e.g. angle="back" +
+#: framing="medium shot" silently reverts to a front-facing shot for most
+#: camera_target values, while the exact opposite framing values are the
+#: ones that fail for camera_target="chest". Photography jargon like
+#: "medium shot" seems to be part of the problem, so this describes each
+#: shot as one literal, physical crop boundary instead (e.g. "framed from
+#: waist to knee") with no abstract framing/angle terms to recombine.
+#:
+#: Every combination of orientation x body region is listed below
+#: rather than hand-picked, including ones that may not make sense
+#: (e.g. "Head - Back") - keep all of them until the next round of
+#: testing shows which to drop or reword. One flat dict, one value per
+#: option - no templating/generation step to re-derive a value from.
+_SHOT_DESCRIPTION_PHRASES = {
+    "Full Body - Front": "a full-body shot, front view, facing the camera, from head to toe",
+    "Full Body - Front 3/4 Left": "a full-body shot, turned three-quarters to the left, from head to toe",
+    "Full Body - Front 3/4 Right": "a full-body shot, turned three-quarters to the right, from head to toe",
+    "Full Body - Left Profile": "a full-body shot, left profile, from head to toe",
+    "Full Body - Right Profile": "a full-body shot, right profile, from head to toe",
+    "Full Body - Back 3/4 Left": "a full-body shot, mostly turned away, seen three-quarters from the back on the left side, from head to toe",
+    "Full Body - Back 3/4 Right": "a full-body shot, mostly turned away, seen three-quarters from the back on the right side, from head to toe",
+    "Full Body - Back": "a full-body shot, back view, from head to toe",
+    "Upper Body - Front": "front view, facing the camera, framed from waist to top of head",
+    "Upper Body - Front 3/4 Left": "turned three-quarters to the left, framed from waist to top of head",
+    "Upper Body - Front 3/4 Right": "turned three-quarters to the right, framed from waist to top of head",
+    "Upper Body - Left Profile": "left profile, framed from waist to top of head",
+    "Upper Body - Right Profile": "right profile, framed from waist to top of head",
+    "Upper Body - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, framed from waist to top of head",
+    "Upper Body - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, framed from waist to top of head",
+    "Upper Body - Back": "back view, framed from waist to top of head",
+    "Lower Body - Front": "front view, facing the camera, framed between the stomach and the feet",
+    "Lower Body - Front 3/4 Left": "turned three-quarters to the left, framed between the stomach and the feet",
+    "Lower Body - Front 3/4 Right": "turned three-quarters to the right, framed between the stomach and the feet",
+    "Lower Body - Left Profile": "left profile, framed between the stomach and the feet",
+    "Lower Body - Right Profile": "right profile, framed between the stomach and the feet",
+    "Lower Body - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, framed from the lower back to the feet",
+    "Lower Body - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, framed from the lower back to the feet",
+    "Lower Body - Back": "back view, framed from the lower back to the feet",
+    "Upper Legs - Front": "front view, facing the camera, framed from waist to knee",
+    "Upper Legs - Front 3/4 Left": "turned three-quarters to the left, framed from waist to knee",
+    "Upper Legs - Front 3/4 Right": "turned three-quarters to the right, framed from waist to knee",
+    "Upper Legs - Left Profile": "left profile, framed from waist to knee",
+    "Upper Legs - Right Profile": "right profile, framed from waist to knee",
+    "Upper Legs - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, framed from waist to knee",
+    "Upper Legs - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, framed from waist to knee",
+    "Upper Legs - Back": "back view, framed from waist to knee",
+    "Lower Legs - Front": "front view, facing the camera, framed from knee to feet",
+    "Lower Legs - Front 3/4 Left": "turned three-quarters to the left, framed from knee to feet",
+    "Lower Legs - Front 3/4 Right": "turned three-quarters to the right, framed from knee to feet",
+    "Lower Legs - Left Profile": "left profile, framed from knee to feet",
+    "Lower Legs - Right Profile": "right profile, framed from knee to feet",
+    "Lower Legs - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, framed from knee to feet",
+    "Lower Legs - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, framed from knee to feet",
+    "Lower Legs - Back": "back view, framed from knee to feet",
+    "Waist - Front": "front view, facing the camera, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Front 3/4 Left": "turned three-quarters to the left, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Front 3/4 Right": "turned three-quarters to the right, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Left Profile": "left profile, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Right Profile": "right profile, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Waist - Back": "back view, a close-up, framed from the chest to the upper legs, centered on the waist",
+    "Chest - Front": "front view, facing the camera, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Front 3/4 Left": "turned three-quarters to the left, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Front 3/4 Right": "turned three-quarters to the right, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Left Profile": "left profile, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Right Profile": "right profile, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Chest - Back": "back view, a close-up, top of frame is the shoulders, bottom of frame is the waist",
+    "Head - Front": "front view, facing the camera, close framing on the head",
+    "Head - Front 3/4 Left": "turned three-quarters to the left, close framing on the head",
+    "Head - Front 3/4 Right": "turned three-quarters to the right, close framing on the head",
+    "Head - Left Profile": "left profile, close framing on the head",
+    "Head - Right Profile": "right profile, close framing on the head",
+    "Head - Back 3/4 Left": "mostly turned away, seen three-quarters from the back on the left side, close framing on the head",
+    "Head - Back 3/4 Right": "mostly turned away, seen three-quarters from the back on the right side, close framing on the head",
+    "Head - Back": "back view, close framing on the head",
 }
-_ANGLE_OPTIONS = list(_ANGLE_PHRASES.keys())
+_SHOT_DESCRIPTION_OPTIONS = list(_SHOT_DESCRIPTION_PHRASES.keys())
 
-_FRAMING_PHRASES = {
-    "extreme wide shot": "an extreme wide shot",
-    "wide shot (full body)": "a full-body wide shot, the entire figure visible from head to toe",
-    "medium wide shot (knees-up)": "a medium-wide shot from the knees up",
-    "medium shot (waist-up)": "a medium shot from the waist up",
-    "medium close-up (chest-up)": "a medium close-up from the chest up",
-    "close-up (shoulders/face)": "a close-up of the shoulders and face",
-    "extreme close-up (eyes/detail)": "an extreme close-up on the eyes and fine detail",
-}
-_FRAMING_OPTIONS = list(_FRAMING_PHRASES.keys())
+#: `expression` only gets mentioned in the prompt when the face is
+#: actually in frame: the region has to include the head at all (Chest/
+#: Waist/Lower Body/Upper Legs/Lower Legs never do), and the orientation
+#: has to face the camera (profile/back views don't show the face even
+#: when the region would otherwise include it).
+_FACE_VISIBLE_REGIONS = {"Full Body", "Upper Body", "Head"}
+_FACE_VISIBLE_ORIENTATIONS = {"Front", "Front 3/4 Left", "Front 3/4 Right"}
 
 _EXPRESSION_PHRASES = {
     "neutral": "neutral",
@@ -1450,8 +1702,8 @@ _EXPRESSION_PHRASES = {
 }
 _EXPRESSION_OPTIONS = list(_EXPRESSION_PHRASES.keys())
 
-#: Separator packed between the three combo values — chosen because none of
-#: the option strings above contain it, so splitting is unambiguous.
+#: Separator packed between the combo values — chosen because none of the
+#: option strings above contain it, so splitting is unambiguous.
 _SHOT_CONFIG_SEP = "||"
 
 #: How many shot_N sockets H3LookSheetsCustomPrompt exposes at once.
@@ -1459,18 +1711,22 @@ _MAX_CUSTOM_SHOTS = 15
 
 
 class H3LookSheetsShotConfig:
-    """One shot's angle, framing and expression, packed into one string.
+    """One shot's description and expression, packed into one string.
+
+    `shot_description` is a single combo covering body region and camera
+    orientation together (e.g. "Lower Legs - Back"), instead of composing
+    them from separate angle/framing/camera_target combos - see the note
+    above _SHOT_DESCRIPTION_PHRASES for why.
 
     Feeds a single `shot_N` socket on H3LookSheetsCustomPrompt — see the
-    module note above for why this exists instead of three plain combos.
+    module note above for why this exists instead of two plain combos.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "angle": (_ANGLE_OPTIONS,),
-                "framing": (_FRAMING_OPTIONS,),
+                "shot_description": (_SHOT_DESCRIPTION_OPTIONS,),
                 "expression": (_EXPRESSION_OPTIONS,),
             },
         }
@@ -1480,8 +1736,10 @@ class H3LookSheetsShotConfig:
     FUNCTION = "build"
     CATEGORY = "H3LookSheets"
 
-    def build(self, angle, framing, expression):
-        return (_SHOT_CONFIG_SEP.join((angle, framing, expression)),)
+    def build(self, shot_description, expression):
+        return (_SHOT_CONFIG_SEP.join(
+            (shot_description, expression)
+        ),)
 
 
 class H3LookSheetsCustomPrompt(io.ComfyNode):
@@ -1497,11 +1755,12 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
     matches how many entries were in it, no separate count input needed.
 
     The shot list itself is not fixed — each `shot_N` socket (fed by an
-    H3LookSheetsShotConfig node) supplies its own angle, framing and
-    expression, and however many are actually connected becomes the shot
-    count (1 to 15). <Picture 1> is always anchored to whatever the first
-    connected shot describes, so the header stays consistent with it even
-    when shot 1 isn't the usual full-body/front/neutral default.
+    H3LookSheetsShotConfig node) supplies its own angle, framing, camera
+    angle/height/target and expression, and however many are actually
+    connected becomes the shot count (1 to 15). <Picture 1> is always
+    anchored to whatever the first connected shot describes, so the header
+    stays consistent with it even when shot 1 isn't the usual
+    full-body/front/eye-level/neutral default.
     """
 
     @classmethod
@@ -1526,7 +1785,12 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
                     ),
                 ),
             ],
-            outputs=[io.String.Output(display_name="prompt")],
+            # shot_count is appended after prompt so links saved on output 0 stay put.
+            outputs=[
+                io.String.Output(display_name="prompt"),
+                io.Int.Output(display_name="shot_count",
+                    tooltip="How many shots the prompt describes — feed it to Select Frames' shot_count."),
+            ],
         )
 
     @classmethod
@@ -1560,14 +1824,14 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{text} from {tag}" for text, tag in zip(outfit_items, outfit_tags)
         )
 
-        parsed: list[tuple[str, str, str]] = []
+        parsed: list[tuple[str, str]] = []
         for value in (shots or {}).values():
             if not value:
                 continue
             parts = value.split(_SHOT_CONFIG_SEP)
-            if len(parts) != 3:
+            if len(parts) != 2:
                 continue
-            parsed.append((parts[0], parts[1], parts[2]))
+            parsed.append(tuple(parts))
 
         total_shots = max(1, len(parsed))
         duration = float(video_duration_seconds)
@@ -1576,7 +1840,6 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
         step = max(0.1, math.floor((duration / total_shots) * 10) / 10)
         at = [_timecode(i * step) for i in range(total_shots)]
         shot_tags = ", ".join(f"[Shot {i + 1}]" for i in range(total_shots))
-        shots_word = _COUNT_WORDS.get(total_shots, str(total_shots))
 
         header = (
             f"subject_definitions:\n<Subject 1> {person}, and the same figure "
@@ -1594,16 +1857,18 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{total_shots} static shots, retaining only {p['poss']} hair, "
             f"body shape, skin, and facial structure from {person_ref}, while "
             f"preserving the outfit from {outfit_ref}. The background remains "
-            f"{set_dressing}. Framing, angle and expression change shot to "
-            "shot as described below; pose is otherwise held still within "
-            "each shot."
+            f"{set_dressing}. Framing changes shot to shot as "
+            "described below; pose is otherwise held still within each shot."
         )
 
         outfit_retention = "\n".join(
             f"{tag} (appears in {shot_tags}): partially_preserved - "
             "retains only the outfit; hair, hairstyle, and hair texture of "
-            f"{subject_noun} shown here are not preserved; no other visual "
-            "elements or props preserved."
+            f"{subject_noun} shown here are not preserved; this photo's own "
+            "camera angle and pose are not preserved either — every shot "
+            "uses its own angle and pose from the list below, never the "
+            "angle or pose this reference photo happens to be shot in; no "
+            "other visual elements or props preserved."
             for tag in outfit_tags
         )
         retention = (
@@ -1614,53 +1879,154 @@ class H3LookSheetsCustomPrompt(io.ComfyNode):
             f"{outfit_retention}"
         )
 
-        # The explicit "only the camera moves, hair stays at rest" clause is
-        # load-bearing: without it H3 tends to render windswept/flying hair
-        # between cuts, as if carrying motion over from a turn that never
-        # actually happened.
+        # The explicit "hair rests still" clause is load-bearing: without
+        # it H3 tends to render windswept/flying hair between cuts, as if
+        # carrying motion over from a turn that never actually happened.
+        # The intro used to describe the camera "repositioning... to capture
+        # each new shot" — continuous travel wording — while every shot
+        # below is introduced as "a hard cut". That mismatch (continuous
+        # camera move vs. instant cut) read as conflicting motion signals
+        # and showed up as residual drift/sway instead of a clean stop
+        # between shots, so the intro now describes instant cuts to a new,
+        # fixed camera position, never movement.
+        # The within-shot stillness clause is separate from the hard-cut
+        # wording above: that one stops the camera from drifting *between*
+        # shots, this one stops it from creeping up/down *within* a single
+        # shot. First tried as a list of negated verbs ("does not rise,
+        # sink, drift, pan, tilt, or zoom") — that made the drift worse, not
+        # better, likely because naming the motions (even negated) cues H3
+        # toward them. Positive, static-only wording ("tripod-mounted",
+        # "locked-off") reads as still without naming any motion at all.
+        # Watch "torso, shoulders and hips stay facing the camera": every cut
+        # moves the camera, so on a Back or Side shot it may pull the body
+        # round to face the lens instead of showing the back or profile. If
+        # it does, "facing that same direction" keeps the pose fixed without
+        # tying it to the camera.
         intro = (
             f"The target video uses a static studio lighting setup against "
-            f"{set_dressing}. All shots are framed with generous empty "
-            "margins on every side, ensuring the entire figure and any "
-            "extensions remain fully within the frame without touching or "
-            f"crossing edges. {set_dressing[0].upper()}{set_dressing[1:]} "
+            f"{set_dressing}. "
+            f"{set_dressing[0].upper()}{set_dressing[1:]} "
             "and its bright, even lighting stay completely identical across "
-            f"all {shots_word} shots. No text, watermark, logo, caption, or "
+            "every shot. No text, watermark, logo, caption, or "
             "writing of any kind appears anywhere in the video. "
             f"<Subject 1> wears the outfit and accessories from {outfit_ref} "
-            f"continuously from the very first frame through all {shots_word} "
-            "shots, without any garment changing, shifting, or being "
+            "continuously from the very first frame through every shot, "
+            "without any garment changing, shifting, or being "
             f"removed. <Subject 1>'s hair, hairstyle, and haircut come from "
-            f"{person_ref} and stay identical across all {shots_word} shots. "
-            "Between every shot, only the camera's position around "
-            "<Subject 1> changes to "
-            "capture each new angle — <Subject 1> remains completely "
-            "motionless throughout, holding one exact pose without turning, "
-            "walking, gesturing, or otherwise moving between cuts, and hair "
-            "stays at rest in that pose, undisturbed by any camera movement."
+            f"{person_ref} and stay identical across every shot. "
+            "<Subject 1> stands perfectly still like a statue, upright, "
+            "weight evenly on both feet, feet together, arms hanging relaxed "
+            f"at {p['poss']} sides, chin level, {p['poss']} shoulders square "
+            f"and aligned with {p['poss']} hips, {p['poss']} whole body facing "
+            "one fixed direction, frozen in this exact pose for the entire "
+            f"video; {p['poss']} hair rests still within each shot. The only "
+            "motion in the video is slow, subtle breathing and an occasional "
+            f"blink; {p['poss']} torso, shoulders and hips stay facing the "
+            "camera. Each shot is an instant hard cut to a new camera "
+            "position and angle relative to <Subject 1>. Within each shot, "
+            "the camera is a single static, locked-off shot, as if mounted "
+            "on a tripod: completely still from the first frame of the shot "
+            "to the last, right up to the next hard cut."
         )
 
         shot_lines = []
-        for i, (angle, framing, expression) in enumerate(parsed):
-            framing_text = _FRAMING_PHRASES.get(framing, framing)
-            angle_text = _ANGLE_PHRASES.get(angle, angle)
-            expr_text = _EXPRESSION_PHRASES.get(expression, expression)
+        for i, (shot_description, expression) in enumerate(parsed):
+            shot_text = _SHOT_DESCRIPTION_PHRASES.get(shot_description, shot_description)
+            region, _, orientation = shot_description.rpartition(" - ")
             if i == 0:
                 opener = "[Shot 1] "
             else:
-                opener = f"[Shot {i + 1}] At {at[i]}, the shot cuts to "
-            shot_lines.append(
-                f"{opener}{framing_text} of <Subject 1>, wearing the outfit "
-                f"from {outfit_ref}, {angle_text}, "
-                f"with a {expr_text} expression."
+                opener = f"[Shot {i + 1}] At {at[i]}, a hard cut to "
+            line = (
+                f"{opener}{shot_text}, wearing the outfit from {outfit_ref}, "
+                f"a static, locked-off shot"
             )
+            if i == len(parsed) - 1:
+                # The "right up to the next hard cut" clause in the intro has
+                # nothing to refer to for the last shot - state explicitly
+                # that stillness holds through to the end instead.
+                line += ", held until the end of the video"
+            if region in _FACE_VISIBLE_REGIONS and orientation in _FACE_VISIBLE_ORIENTATIONS:
+                expr_text = _EXPRESSION_PHRASES.get(expression, expression)
+                line += f", with a {expr_text} expression"
+            shot_lines.append(line + ".")
         detail = "detailed_description:\n" + intro + "\n" + "\n".join(shot_lines)
 
         prompt = (
             f"{header}\n\n{summary}\n\n{retention}\n\n{detail}\n\n"
             "overall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A"
         )
-        return io.NodeOutput(prompt)
+        return io.NodeOutput(prompt, total_shots)
+
+
+#: Rendered by web/h3looksheets_prompt_view.js; the value is JSON:
+#: {"override": bool, "text": str}. `text` is only meaningful while
+#: `override` is true — the editor seeds it from the latest `prompt` input
+#: the first time the user turns override on.
+PromptViewState = io.Custom("H3LOOKSHEETS_PROMPT_VIEW")
+
+
+class H3LookSheetsPromptView(io.ComfyNode):
+    """Preview a prompt's H3 tag syntax (`<Picture N>`, `<Subject N>`,
+    `<Audio N>`, `[Shot N]`, section headers) colorized, with a one-click
+    copy button, before it reaches MiniMaxH3ReferenceToVideo.
+
+    Read-only by default and always mirrors `prompt`. Clicking "Override
+    prompt" unlocks the text for editing in place and switches the output
+    to that edited copy instead; clicking it again drops the edit and goes
+    back to mirroring `prompt`.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="H3LookSheetsPromptView",
+            display_name="Prompt View (H3 Look Sheet)",
+            category="H3LookSheets",
+            inputs=[
+                io.String.Input("prompt", force_input=True),
+                PromptViewState.Input("view_state"),
+            ],
+            outputs=[io.String.Output(display_name="prompt")],
+        )
+
+    @classmethod
+    def execute(cls, prompt, view_state=None) -> io.NodeOutput:
+        state = json.loads(view_state) if view_state else {}
+        text = state.get("text", "") if state.get("override") else prompt
+        # Echoed back so the widget can refresh its read-only mirror of
+        # `prompt` without the node needing to re-run on its own.
+        return io.NodeOutput(text, ui={"h3looksheets_prompt": [prompt]})
+
+
+class H3LookSheetsRefImageSize:
+    """A `match`/`max` picker for MiniMax H3's `ref_image_size`, output as a
+    real COMBO (not STRING).
+
+    ComfyUI only lets a COMBO-typed socket connect to another COMBO-typed
+    socket — a generic passthrough node (Set/Get, reroute-style) declared
+    with a wildcard type does count (wildcards match anything), but a plain
+    STRING output does not (exact type match required once neither side is
+    a wildcard). Declaring RETURN_TYPES as a list, the same way Impact
+    Pack's ImpactSchedulerAdapter does for its scheduler output, keeps this
+    a real COMBO end to end so it survives a Set/Get pair.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ref_image_size": (["match", "max"],),
+            },
+        }
+
+    RETURN_TYPES = (["match", "max"],)
+    RETURN_NAMES = ("ref_image_size",)
+    FUNCTION = "choose"
+    CATEGORY = "H3LookSheets"
+
+    def choose(self, ref_image_size):
+        return (ref_image_size,)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -1668,8 +2034,11 @@ NODE_CLASS_MAPPINGS = {
     "H3ImageAggregator": H3ImageAggregator,
     "H3LookSheetsSelectFrames": H3LookSheetsSelectFrames,
     "H3LookSheetsDatasheetSettings": H3LookSheetsDatasheetSettings,
+    "H3LookSheetsDatasheetImages": H3LookSheetsDatasheetImages,
     "H3LookSheetsShotConfig": H3LookSheetsShotConfig,
     "H3LookSheetsCustomPrompt": H3LookSheetsCustomPrompt,
+    "H3LookSheetsPromptView": H3LookSheetsPromptView,
+    "H3LookSheetsRefImageSize": H3LookSheetsRefImageSize,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1677,6 +2046,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ImageAggregator": "Image Aggregator (H3 Look Sheet)",
     "H3LookSheetsSelectFrames": "Select Frames (H3 Look Sheet)",
     "H3LookSheetsDatasheetSettings": "Datasheet Settings (H3 Look Sheet)",
+    "H3LookSheetsDatasheetImages": "Datasheet Images (H3 Look Sheet)",
     "H3LookSheetsShotConfig": "Shot Config (H3 Look Sheet)",
     "H3LookSheetsCustomPrompt": "Look Sheet Prompt - Custom Shots (H3)",
+    "H3LookSheetsPromptView": "Prompt View (H3 Look Sheet)",
+    "H3LookSheetsRefImageSize": "Ref Image Size (match/max)",
 }
