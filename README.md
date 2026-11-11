@@ -41,6 +41,15 @@ rendered move, lay them out as one sheet.
 >   and the datasheet; its **Note: Model Links** lists every model and custom
 >   node it uses. New standalone `ComfyUI-H3LookSheets-Datasheet.json` to
 >   build a datasheet from existing images.
+>
+> **v1.3**:
+> - The example workflow is renamed
+>   `ComfyUI-H3LookSheets-2StageSamplingUpscaleSeedVR2.json`.
+> - New `ComfyUI-H3LookSheets-2StageSamplingUpscaleRelayVSR.json`: the same
+>   pipeline with a RelayVSR x2 upscale (core RelayVSR nodes) in place of
+>   SeedVR2. It upscales the whole video right after H3 Face Refine (saved as
+>   a video), before **Select Frames**. **Needs ComfyUI v0.45.0 or later**
+>   — see [Requirements](#requirements).
 
 📺 [Demo videos](https://www.youtube.com/playlist?list=PLR0q7a2fnl5w)
 
@@ -55,7 +64,7 @@ rendered move, lay them out as one sheet.
 
 </details>
 
-<details open>
+<details>
 <summary><b>v1.1</b> — person + outfit + accessories references in, look sheet out</summary>
 
 | Person (front/back) | Outfit (front/back) | Shoes | Glasses |
@@ -66,11 +75,25 @@ rendered move, lay them out as one sheet.
 
 </details>
 
+<details open>
+<summary><b>v1.3</b> — person + outfit + accessories references in, RelayVSR x2 upscale, look sheet out</summary>
+
+![MiniMax base vs + Face Refine vs + Face Refine + RelayVSR](example_results/1.3/compare.webp)
+
+| Person (front) | Outfit (front/back) | Glasses | Shoes |
+|---|---|---|---|
+| ![Person reference](example_results/1.3/1.3_person_front.webp) | ![Outfit reference](example_results/1.3/1.3_outfit_mannequin_front_back.webp) | ![Glasses reference](example_results/1.3/1.3_glasses.webp) | ![Shoes reference](example_results/1.3/1.3_shoes.webp) |
+
+![Result look sheet](example_results/1.3/1.3_result.webp)
+
+</details>
+
 ---
 
 ## The pipeline, node by node
 
-As wired in `example_workflows/ComfyUI-H3LookSheets-2StageSamplingUpscale.json`.
+As wired in `example_workflows/ComfyUI-H3LookSheets-2StageSamplingUpscaleSeedVR2.json`
+(`...RelayVSR.json` only differs at step 8).
 Steps 1–4, 7, 9 and 10 are this pack. Step 5 is core ComfyUI/MiniMax H3 (plus
 a latent upscaler pack), steps 6 and 8 are optional post-processing from
 other packs. The workflow's **Note: Model Links** lists every model and
@@ -102,12 +125,17 @@ custom node used.
    `shot_count` from step 4 for the `per_shot` scope → `frames` (saved).
 8. **Upscale** (optional): `frames`, turned into an image list, go through
    the **Upscale Image (SeedVR2 7B Int8)** subgraph (core SeedVR2 nodes) →
-   upscaled frames (saved).
+   upscaled frames (saved). The RelayVSR workflow moves the upscale between
+   steps 6 and 7: the whole refined video goes through the **Upscale Image
+   (RelayVSR x2)** subgraph (core RelayVSR nodes, fixed 2× upscale) → upscaled
+   frames (also saved as a video), and **Select Frames** picks from those.
 9. **Choose the images**: the upscaled frames go into **Datasheet Images**,
    where each one can be switched on/off and more can be added by hand →
    `images`.
 10. **Lay them out**: `images` goes into **Datasheet Settings** → `sheet`
     (IMAGE), the finished contact sheet, saved under `h3looksheet/datasheet`.
+
+`...SeedVR2.json`:
 
 ```
 LoadImage (person) ─► Describe Reference (target=person) ─► description ──────┐
@@ -134,6 +162,27 @@ LoadImage (outfit) ×N ─► Describe Reference (target=outfit) ─► descript
                                ▼
                Upscale Image - SeedVR2 (optional)
                                │ images
+                               ▼
+                       Datasheet Images
+                               │ images
+                               ▼
+                      Datasheet Settings ─► sheet (IMAGE)
+```
+
+`...RelayVSR.json` (same up to step 5, the upscale moves before Select Frames):
+
+```
+       2 Stage Sampling + Upscale ...                                   │ shot_count
+                               │ frames                                 │
+                               ▼                                        │
+                   H3 Face Refine (optional)                            │
+                               │ frames                                 │
+                               ▼                                        │
+         Upscale Image - RelayVSR x2 (optional) ─► video                │
+                               │ frames                                 │
+                               ▼                                        │
+                         Select Frames ◄────────────────────────────────┘
+                               │ frames
                                ▼
                        Datasheet Images
                                │ images
@@ -434,8 +483,15 @@ Frames**) out as one contact-sheet image. No per-tile labels, no vision call.
 vision-language CLIP that supports `.generate()` (Qwen3-VL) for **Describe
 Reference** and (optionally) tier 2 of **Select Frames**. The example
 workflow's post-processing needs more models and custom nodes (latent
-upscaler, H3 Face Refine, SeedVR2, KJNodes, Impact Pack…): its **Note: Model
+upscaler, H3 Face Refine, SeedVR2 or RelayVSR, KJNodes, Impact Pack…): its **Note: Model
 Links** lists them all with download links.
+
+**ComfyUI**: the RelayVSR workflow needs ComfyUI **v0.45.0** or later. Its
+`RelayVSRConditioning` and `VSR Decode` nodes are core ComfyUI nodes, first
+released in v0.45.0 (2026-11-10), which ships comfyui-frontend-package 1.58.5
+and comfy-kitchen 0.2.41. On v0.44.0 or older the RelayVSR subgraph shows
+missing nodes: update ComfyUI, no custom node to install. The SeedVR2 workflow
+runs on v0.44.0.
 
 **Python**: nothing outside what ComfyUI already ships (`torch`, `numpy`,
 `Pillow`) — no `requirements.txt` needed.
@@ -451,11 +507,23 @@ git clone https://github.com/shisa84/ComfyUI-H3LookSheets
 
 Restart ComfyUI. The nodes appear under the **H3LookSheets** category.
 
+To update to the latest version:
+
+```bash
+cd ComfyUI/custom_nodes/ComfyUI-H3LookSheets
+git pull
+```
+
+Restart ComfyUI and refresh the browser page. Reload the graphs from
+`example_workflows/` to get the new versions (a graph already open or saved
+keeps its old copy).
+
 Load a graph from `example_workflows/` (canvas format, drag onto the canvas):
 
 | Workflow | What it is |
 |---|---|
-| `ComfyUI-H3LookSheets-2StageSamplingUpscale.json` | The complete pipeline: describe, prompt, 2-stage sampling + latent upscale, Select Frames, H3 Face Refine, SeedVR2 upscale, datasheet. Its **Note: Model Links** lists every model and custom node it needs |
+| `ComfyUI-H3LookSheets-2StageSamplingUpscaleSeedVR2.json` | The complete pipeline: describe, prompt, 2-stage sampling + latent upscale, Select Frames, H3 Face Refine, SeedVR2 upscale, datasheet. Its **Note: Model Links** lists every model and custom node it needs |
+| `ComfyUI-H3LookSheets-2StageSamplingUpscaleRelayVSR.json` | Same pipeline with a RelayVSR x2 upscale of the whole video (after H3 Face Refine, before Select Frames) instead of SeedVR2. **Needs ComfyUI v0.45.0+** (see [Requirements](#requirements)) |
 | `ComfyUI-H3LookSheets-Datasheet.json` | Datasheet only: **Datasheet Images** → **Datasheet Settings** → save, for images you already have |
 
 ---
