@@ -92,7 +92,7 @@ rendered move, lay them out as one sheet.
 
 ## The pipeline, node by node
 
-As wired in `example_workflows/ComfyUI-H3LookSheets-2StageSamplingUpscaleSeedVR2.json`
+As wired in `example_workflows/ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-SeedVR2.json`
 (`...RelayVSR.json` only differs at step 8).
 Steps 1–4, 7, 9 and 10 are this pack. Step 5 is core ComfyUI/MiniMax H3 (plus
 a latent upscaler pack), steps 6 and 8 are optional post-processing from
@@ -522,7 +522,7 @@ Load a graph from `example_workflows/` (canvas format, drag onto the canvas):
 
 | Workflow | What it is |
 |---|---|
-| `ComfyUI-H3LookSheets-2StageSamplingUpscaleSeedVR2.json` | The complete pipeline: describe, prompt, 2-stage sampling + latent upscale, Select Frames, H3 Face Refine, SeedVR2 upscale, datasheet. Its **Note: Model Links** lists every model and custom node it needs |
+| `ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-SeedVR2.json` | The complete pipeline: describe, prompt, 2-stage sampling + latent upscale, Select Frames, H3 Face Refine, SeedVR2 upscale, datasheet. Its **Note: Model Links** lists every model and custom node it needs |
 | `ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-RelayVSR.json` | Same pipeline with a RelayVSR x2 upscale of the whole video (after H3 Face Refine, before Select Frames) instead of SeedVR2. **Needs ComfyUI v0.45.0+** (see [Requirements](#requirements)) |
 | `ComfyUI-H3LookSheets-Datasheet.json` | Datasheet only: **Datasheet Images** → **Datasheet Settings** → save, for images you already have |
 
