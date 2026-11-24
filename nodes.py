@@ -2029,6 +2029,85 @@ class H3LookSheetsRefImageSize:
         return (ref_image_size,)
 
 
+H3FaceTransform = io.Custom("H3FACEXFORM")
+
+
+class H3LookSheetsFaceSizeFade(io.ComfyNode):
+    """Fade H3 Face Refine's paste out on frames where the face is already
+    big, so close-ups keep the face H3 rendered (refining them adds wrinkles
+    and age) and only small, distant faces get replaced.
+
+    Goes between H3FaceTrackCrop and H3FaceStitch (ComfyUI-H3-FaceRefine):
+    multiplies the transform's per-frame `weights`, which the stitch uses as
+    paste opacity when its `undetected_frames` is `fade_out` (`skip` and
+    `composite_anyway` ignore the weights, and so this node).
+
+    Same idea as PixelAI Labs' H3 Face Size Fade, but the face height is read
+    from the transform's own `face_rect` instead of dividing the crop by a
+    crop_factor widget: a widget that doesn't match the one on Track Crop
+    (these workflows use 3, PixelAI's default is 2.5) shifts every threshold,
+    and a crop clamped to the frame edge reads as a smaller face. Those
+    heights are Track Crop's smoothed per-frame sizes; with its
+    `size_mode=max_of_clip` they are one value for the whole clip.
+
+    `refine` is False when no frame gets any of the fix, to skip the H3 pass
+    through a lazy switch (ComfySwitchNode only runs the branch it picks).
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="H3LookSheetsFaceSizeFade",
+            display_name="Face Size Fade (H3 Look Sheet)",
+            category="H3LookSheets",
+            inputs=[
+                H3FaceTransform.Input("transform"),
+                io.Float.Input("full_fix_below_percent", default=10.0, min=0.5, max=100.0, step=0.5,
+                    tooltip="Face height, in % of the video height, at or under which the refined face is pasted at full strength."),
+                io.Float.Input("no_fix_above_percent", default=17.0, min=0.5, max=100.0, step=0.5,
+                    tooltip="Face height, in % of the video height, at or over which the original face is kept. In between, the paste fades out."),
+            ],
+            outputs=[
+                H3FaceTransform.Output(display_name="transform"),
+                io.Boolean.Output(display_name="refine",
+                    tooltip="False when every frame keeps its original face: nothing to refine."),
+                io.String.Output(display_name="report"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, transform, full_fix_below_percent, no_fix_above_percent) -> io.NodeOutput:
+        src_h = transform["src_size"][1]
+        canvas_h = transform["canvas"][1]
+        lo = full_fix_below_percent
+        hi = max(lo + 0.1, no_fix_above_percent)
+
+        faces, fades, weights = [], [], []
+        for box, rect, w in zip(transform["boxes"], transform["face_rect"], transform["weights"]):
+            face = rect[3] / canvas_h * box[3] / src_h * 100.0
+            x = min(max((face - lo) / (hi - lo), 0.0), 1.0)
+            fade = 1.0 - x * x * (3.0 - 2.0 * x)
+            faces.append(face)
+            fades.append(fade)
+            weights.append(w * fade)
+
+        # Frames Track Crop already faded out (no face seen) are counted apart: their
+        # face size is interpolated, so the fade says nothing about them.
+        n = len(fades)
+        seen = [f for f, w in zip(fades, transform["weights"]) if w > 0.001]
+        full = sum(f >= 0.999 for f in seen)
+        kept = sum(f <= 0.001 for f in seen)
+        refine = any(w > 0.001 for w in weights)
+        step = max(1, n // 12)
+        report = (f"{n} frames, face {min(faces):.1f}-{max(faces):.1f}% of the height "
+                  f"(ramp {lo:g}->{hi:g}% = {lo * src_h / 100:.0f}->{hi * src_h / 100:.0f}px at {src_h}p): "
+                  f"full fix {full}, fading {len(seen) - full - kept}, original kept {kept}, no face {n - len(seen)}"
+                  f"{'' if refine else ' -> nothing to refine'}\n"
+                  + " ".join(f"f{i}:{faces[i]:.1f}%={fades[i]:.2f}" for i in range(0, n, step)))
+        logging.info("[H3LookSheets] Face Size Fade: %s", report)
+        return io.NodeOutput(dict(transform, weights=weights), refine, report)
+
+
 NODE_CLASS_MAPPINGS = {
     "H3LookSheetsDescribe": H3LookSheetsDescribe,
     "H3ImageAggregator": H3ImageAggregator,
@@ -2039,6 +2118,7 @@ NODE_CLASS_MAPPINGS = {
     "H3LookSheetsCustomPrompt": H3LookSheetsCustomPrompt,
     "H3LookSheetsPromptView": H3LookSheetsPromptView,
     "H3LookSheetsRefImageSize": H3LookSheetsRefImageSize,
+    "H3LookSheetsFaceSizeFade": H3LookSheetsFaceSizeFade,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2051,4 +2131,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3LookSheetsCustomPrompt": "Look Sheet Prompt - Custom Shots (H3)",
     "H3LookSheetsPromptView": "Prompt View (H3 Look Sheet)",
     "H3LookSheetsRefImageSize": "Ref Image Size (match/max)",
+    "H3LookSheetsFaceSizeFade": "Face Size Fade (H3 Look Sheet)",
 }
