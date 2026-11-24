@@ -50,6 +50,20 @@ rendered move, lay them out as one sheet.
 >   SeedVR2. It upscales the whole video right after H3 Face Refine (saved as
 >   a video), before **Select Frames**. **Needs ComfyUI v0.45.0 or later**
 >   — see [Requirements](#requirements).
+>
+> **v1.4**:
+> - **2 Stage Sampling + Upscale** gets a `turbo` toggle. On: turbo LoRA,
+>   first pass, latent upscale, second pass (as in v1.3). Off: no LoRA, one
+>   20-step pass at the **Resolution - 1st Stage** size, no upscale.
+> - **H3 Face Refine** gets its own `turbo` toggle. On: turbo LoRA,
+>   `steps (turbo)` (8). Off: no LoRA, `steps (no turbo)` (20).
+> - New node **Face Size Fade**, wired inside **H3 Face Refine**: the refined
+>   face is only pasted where the face is small in the frame; close-ups keep
+>   the face H3 rendered. Works the same with turbo on or off.
+> - The two example workflows are now
+>   `ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-SeedVR2.json` and
+>   `ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-RelayVSR.json`; they replace
+>   the v1.3 ones.
 
 📺 [Demo videos](https://www.youtube.com/playlist?list=PLR0q7a2fnl5w)
 
@@ -96,7 +110,7 @@ As wired in `example_workflows/ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-SeedV
 (`...RelayVSR.json` only differs at step 8).
 Steps 1–4, 7, 9 and 10 are this pack. Step 5 is core ComfyUI/MiniMax H3 (plus
 a latent upscaler pack), steps 6 and 8 are optional post-processing from
-other packs. The workflow's **Note: Model Links** lists every model and
+other packs (step 6 with this pack's **Face Size Fade** inside). The workflow's **Note: Model Links** lists every model and
 custom node used.
 
 1. **Load the reference photos** (`LoadImage` — the person, usually one
@@ -116,11 +130,15 @@ custom node used.
    Sampling + Upscale** subgraph — `MiniMaxH3ReferenceToVideo` (its
    `ref_image_size` set by **Ref Image Size**), a first pass at low
    resolution, `MinimaxH3LatentUpscaler3D`, a second pass, VAE decode → the
-   decoded frames (also saved as a video).
+   decoded frames (also saved as a video). With its `turbo` toggle off, a
+   single 20-step pass without the turbo LoRA replaces the two passes and the
+   upscale.
 6. **Refine the face** (optional): the **H3 Face Refine** subgraph
    ([ComfyUI-H3-FaceRefine](https://github.com/Carasibana/ComfyUI-H3-FaceRefine))
-   re-renders the face on every frame → refined frames (also saved as a
-   video).
+   re-renders the face on every frame, and **Face Size Fade** decides, frame
+   by frame, how much of it is pasted back: all of it on small faces, none on
+   close-ups → refined frames (also saved as a video). Its `turbo` toggle
+   picks 8 steps with the turbo LoRA or 20 steps without.
 7. **Pick the keepers**: the frames go into **Select Frames**, with
    `shot_count` from step 4 for the `per_shot` scope → `frames` (saved).
 8. **Upscale** (optional): `frames`, turned into an image list, go through
@@ -202,6 +220,7 @@ LoadImage (outfit) ×N ─► Describe Reference (target=outfit) ─► descript
 | **Image Aggregator (H3 Look Sheet)** | `H3LookSheets` | Routes the person and outfit images into `MiniMaxH3ReferenceToVideo`'s 9 `ref_image` slots (`H3ImageAggregator`) |
 | **Prompt View (H3 Look Sheet)** | `H3LookSheets` | Colorized read-only preview of a prompt, with a copy button and an edit-a-copy override (`H3LookSheetsPromptView`) |
 | **Ref Image Size (match/max)** | `H3LookSheets` | A `match`/`max` picker for `MiniMaxH3ReferenceToVideo`'s `ref_image_size`, output as a real combo so it survives a Set/Get pair (`H3LookSheetsRefImageSize`) |
+| **Face Size Fade (H3 Look Sheet)** | `H3LookSheets` | In H3 Face Refine, pastes the refined face only where the face is small; close-ups keep the original (`H3LookSheetsFaceSizeFade`) |
 | **Select Frames (H3 Look Sheet)** | `H3LookSheets` | Picks reference frames out of the rendered take (`H3LookSheetsSelectFrames`) |
 | **Datasheet Images (H3 Look Sheet)** | `H3LookSheets` | Chooses which images go into the datasheet, from the flow and/or added by hand (`H3LookSheetsDatasheetImages`) |
 | **Datasheet Settings (H3 Look Sheet)** | `H3LookSheets` | Lays the picked frames out as one contact-sheet image (`H3LookSheetsDatasheetSettings`) |
@@ -350,6 +369,37 @@ A dropdown for `MiniMaxH3ReferenceToVideo`'s `ref_image_size` (`match` /
 Set/Get pair to drive several `MiniMaxH3ReferenceToVideo` nodes from one
 place. A plain `Primitive` or `STRING` node cannot connect to a combo input;
 this node can.
+
+---
+
+### Face Size Fade (H3 Look Sheet)
+
+Goes between **H3 Face Track Crop** and **H3 Face Stitch**
+([ComfyUI-H3-FaceRefine](https://github.com/Carasibana/ComfyUI-H3-FaceRefine)),
+inside the **H3 Face Refine** subgraph. Face Refine helps small, distant
+faces; on a close-up it only adds wrinkles and age. This node measures the
+face on every frame and sets how much of the refined face is pasted back:
+
+| Face height | Pasted |
+|---|---|
+| up to `full_fix_below_percent` of the video height | all of the refined face |
+| between the two settings | a gradual mix |
+| from `no_fix_above_percent` of the video height | nothing: the original face is kept |
+
+The sizes are a % of the height of the video that goes into Face Refine, so
+the same values work at any resolution and with `turbo` on or off.
+
+| Input | Notes |
+|---|---|
+| `transform` | From **H3 Face Track Crop** |
+| `full_fix_below_percent` | Default 10 |
+| `no_fix_above_percent` | Default 17 |
+
+| Output | Notes |
+|---|---|
+| `transform` | To **H3 Face Stitch** (its `undetected_frames` must stay on `fade_out`) |
+| `refine` | `false` when no frame gets any of the refined face |
+| `report` | Face size range, the two thresholds in pixels, and how many frames got the full fix, a mix, the original face, or had no face |
 
 ---
 
@@ -522,7 +572,7 @@ Load a graph from `example_workflows/` (canvas format, drag onto the canvas):
 
 | Workflow | What it is |
 |---|---|
-| `ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-SeedVR2.json` | The complete pipeline: describe, prompt, 2-stage sampling + latent upscale, Select Frames, H3 Face Refine, SeedVR2 upscale, datasheet. Its **Note: Model Links** lists every model and custom node it needs |
+| `ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-SeedVR2.json` | The complete pipeline: describe, prompt, 2-stage sampling + latent upscale, H3 Face Refine (with Face Size Fade), Select Frames, SeedVR2 upscale, datasheet. Sampling and Face Refine each have a `turbo` toggle (turbo LoRA, 8 steps / no LoRA, 20 steps). Its **Note: Model Links** lists every model and custom node it needs |
 | `ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-RelayVSR.json` | Same pipeline with a RelayVSR x2 upscale of the whole video (after H3 Face Refine, before Select Frames) instead of SeedVR2. **Needs ComfyUI v0.45.0+** (see [Requirements](#requirements)) |
 | `ComfyUI-H3LookSheets-Datasheet.json` | Datasheet only: **Datasheet Images** → **Datasheet Settings** → save, for images you already have |
 
