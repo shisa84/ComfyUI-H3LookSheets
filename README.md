@@ -523,7 +523,7 @@ Load a graph from `example_workflows/` (canvas format, drag onto the canvas):
 | Workflow | What it is |
 |---|---|
 | `ComfyUI-H3LookSheets-2StageSamplingUpscaleSeedVR2.json` | The complete pipeline: describe, prompt, 2-stage sampling + latent upscale, Select Frames, H3 Face Refine, SeedVR2 upscale, datasheet. Its **Note: Model Links** lists every model and custom node it needs |
-| `ComfyUI-H3LookSheets-2StageSamplingUpscaleRelayVSR.json` | Same pipeline with a RelayVSR x2 upscale of the whole video (after H3 Face Refine, before Select Frames) instead of SeedVR2. **Needs ComfyUI v0.45.0+** (see [Requirements](#requirements)) |
+| `ComfyUI-H3LookSheets-Turbo8Steps-or-20Steps-RelayVSR.json` | Same pipeline with a RelayVSR x2 upscale of the whole video (after H3 Face Refine, before Select Frames) instead of SeedVR2. **Needs ComfyUI v0.45.0+** (see [Requirements](#requirements)) |
 | `ComfyUI-H3LookSheets-Datasheet.json` | Datasheet only: **Datasheet Images** → **Datasheet Settings** → save, for images you already have |
 
 ---
